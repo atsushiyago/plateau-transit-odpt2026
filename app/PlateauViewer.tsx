@@ -94,8 +94,6 @@ const BUS_STOP_PIXEL_SIZE = 10;
 // 「同じ系統だがその他事業者」と分かるようにしている。
 const BUS_STOP_COLOR_MINOR = Cesium.Color.fromCssColorString("#fde68a");
 const BUS_STOP_PIXEL_SIZE_MINOR = BUS_STOP_PIXEL_SIZE;
-const BUS_STOP_COLOR_FREQ_MEDIUM = Cesium.Color.fromCssColorString("#fbbf24");
-const BUS_STOP_COLOR_FREQ_LOW = Cesium.Color.fromCssColorString("#fed7aa");
 const BUS_STOP_COLOR_FREQ_EXCLUDED = Cesium.Color.fromCssColorString("#64748b");
 
 // 起動時の初期カメラ表示範囲（ユーザー指定の中心点・半径・角度）。
@@ -1127,7 +1125,7 @@ function Legend({
       </div>
       {frequencyMode !== "none" && (
         <div style={{ fontSize: 10.5, color: "#f8fafc", marginTop: 4, lineHeight: 1.4 }}>
-          運行頻度反映時: 濃い橙(大)=毎時4本以上 ／ 淡橙(中〜小)=4本未満 ／ 灰(小)=条件未満・運休時間帯
+          運行頻度反映時: 大きい橙=毎時4本以上 ／ 小さめ橙=4本未満 ／ 灰(小)=条件未満・運休時間帯
         </div>
       )}
       {SHOW_AUTO_CANDIDATE_AND_COMPARISON_UI && (
@@ -3020,12 +3018,12 @@ export default function PlateauViewer() {
             rec.entity.point.pixelSize = new Cesium.ConstantProperty(12);
             rec.entity.point.outlineWidth = new Cesium.ConstantProperty(2);
           } else if (perHour >= 1) {
-            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_FREQ_MEDIUM);
-            rec.entity.point.pixelSize = new Cesium.ConstantProperty(10);
+            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
+            rec.entity.point.pixelSize = new Cesium.ConstantProperty(9);
             rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
           } else {
-            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_FREQ_LOW);
-            rec.entity.point.pixelSize = new Cesium.ConstantProperty(8);
+            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
+            rec.entity.point.pixelSize = new Cesium.ConstantProperty(7);
             rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
           }
         }
