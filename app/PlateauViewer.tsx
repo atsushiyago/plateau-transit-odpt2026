@@ -1,0 +1,4781 @@
+"use client";
+
+import {
+  WALK_PROFILES,
+  DISTANCE_MODEL_DEFAULT,
+  haversineMeters,
+  projectToLocalMeters,
+  unprojectFromLocalMeters,
+  kMeans,
+  BUILDING_NETWORK_SCORES_JSON_URL,
+  evaluateCustomStopsSimulation,
+  buildCustomStopSimulationGeoJson,
+  MOBILITY_HUB_CANDIDATES,
+  MOBILITY_HUB_MODES,
+  evaluateMobilityHubSimulation,
+  buildMobilityHubSimulationGeoJson,
+  type WalkProfile,
+  type DistanceModel,
+  type BuildingNetworkScoreRow,
+  type DemandTransitPlanAnalysis,
+  type DemandTransitMember,
+  type DemandTransitPlanSite,
+  type CustomStopSite,
+  type CustomStopSimulationSummary,
+  type CustomStopBuildingRecord,
+  type CustomStopExportItem,
+  type NewlyCoveredBuildingExportItem,
+  type MobilityHubSite,
+  type MobilityHubMode,
+  type MobilityHubSiteConfig,
+  type MobilityHubSimulationSummary,
+  type MobilityHubBuildingRecord,
+  type MobilityHubCoveredBuildingExportItem,
+} from "./lib/transit-analysis";
+import { NetworkRouter, type RoutingGraph } from "./lib/network-routing";
+import { TileWorkGate } from "./lib/async-generation";
+import type { AnalysisResponse } from "./workers/transit-analysis.worker";
+import { SlopeCalculationModal } from "./SlopeCalculationModal";
+import { useEffect, useRef, useState, useCallback, type ReactNode } from "react";
+import * as Cesium from "cesium";
+
+// 表示したい自治体コード（14205 = 神奈川県藤沢市）。
+// 総務省の全国地方公共団体コード表で他の自治体コードに差し替え可能。
+// https://www.soumu.go.jp/denshijiti/code.html
+const CITY_CODE = "14205";
+
+// 複合tileset.json API: 自治体コード + "-latest" で最新整備年度のLOD1建物データに自動追従する。
+const BUILDING_TILESET_URL = `https://api.plateauview.mlit.go.jp/datacatalog/3dtiles/${CITY_CODE}-bldg-lod1-latest/tileset.json`;
+
+// PLATEAU-Terrain（Cesium ionトークン不要で利用可能）
+// 注意: layer.json は https://tile.plateauview.mlit.go.jp/terrain/layer.json にあり、
+// ベースURLは "/terrain" まで（オルソ画像のような年度サフィックスは付かない）
+const TERRAIN_URL = "https://tile.plateauview.mlit.go.jp/terrain";
+
+// PLATEAU-Ortho（航空写真オルソ画像。ionトークン不要）
+const ORTHO_URL = "https://tile.plateauview.mlit.go.jp/tiles/plateau-ortho-2023/{z}/{x}/{y}.png";
+
+// OpenStreetMapタイル。航空写真の上に半透明で重ね、道路網・路線名・交差点を明瞭にする。
+const OSM_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+
+// バス停データ（藤沢市北部、JR東海道線より北側のみ、337件）。
+// 【正式決定・データソース切替済み】当初はOpenStreetMap（Overpass API）由来のデータを暫定的に
+// 使っていたが、事業者名タグの欠落が多い（653件中72件のみ）という制約があったため、国土数値情報
+// 「バス停留所データ（P11、第3.0版、2022年度）」に切り替えた。P11は全国のバス停すべてに
+// バス事業者名（コミュニティバスは自治体名）が付与されているため、事業者不明のバス停が存在しない。
+// 神奈川中央交通のGTFS-JP自体は引き続き「公共交通オープンデータチャレンジ2026」限定ライセンスの
+// APIキーが必要で、申込期間（2026年10月1日〜）がまだ開始していないため入手不可能（詳細はAGENTS.md参照）。
+const BUS_STOPS_JSON_URL = "/data/bus-stops.json";
+
+const BUS_STOP_COLOR = Cesium.Color.fromCssColorString("#f59e0b");
+const BUS_STOP_PIXEL_SIZE = 10;
+// 神奈川中央交通以外（コミュニティバス等、下記MAJOR_OPERATOR_KEYWORDSに一致しない事業者）の
+// バス停は参考表示として残しつつ、視覚的に控えめにする（「どのピンが実効距離の計算に
+// 使われているか」が見た目で分かるようにする）。
+// 当初は同じ#f59e0bを透明度35%にして小さく表示していたが、Cesiumのpointは背景（建物の色・
+// 地表色）と実際に合成されるため、赤い建物の上では暗く沈み、白い建物の上では薄く白っぽく、
+// 何もない地表（ortho画像未読み込み/欠損時のフォールバック色）の上では灰色がかって見えるなど、
+// 背景次第で色がバラついて見える問題があった。→ 不透明な淡いアンバー色に変更し、背景に関わらず
+// 一定の見た目になるようにした。主要事業者と同じサイズにしつつ、色相は保って
+// 「同じ系統だがその他事業者」と分かるようにしている。
+const BUS_STOP_COLOR_MINOR = Cesium.Color.fromCssColorString("#fde68a");
+const BUS_STOP_PIXEL_SIZE_MINOR = BUS_STOP_PIXEL_SIZE;
+
+// 起動時の初期カメラ表示範囲（ユーザー指定の中心点・半径・角度）。
+const INITIAL_VIEW_CENTER_LNG = 139.44893;
+const INITIAL_VIEW_CENTER_LAT = 35.365;
+const INITIAL_VIEW_RADIUS_METERS = 1213;
+const INITIAL_VIEW_HEADING = 350;
+const INITIAL_VIEW_PITCH = -34.7;
+
+// 実効距離（アクセシビリティスコア）の計算に使う「主要事業者」の判定キーワード。
+// P11データのバス事業者名（P11_002）は藤沢市北部エリアでは「神奈川中央交通（株）」の表記で
+// 統一されている（表記ゆれ無し。実データで確認済み）が、将来のデータ更新で法人格表記
+// （（株）の位置等）が変わる可能性を考慮し、部分一致で判定する。
+const MAJOR_OPERATOR_KEYWORDS = ["神奈川中央交通", "江ノ電バス"];
+function isMajorOperatorStop(stop: BusStop): boolean {
+  return MAJOR_OPERATOR_KEYWORDS.some((keyword) => stop.operator.includes(keyword));
+}
+
+type BusRoute = { name: string; classCode: string | null };
+type BusStop = { name: string; lat: number; lng: number; operator: string; routes: BusRoute[] };
+
+// 分析用施設はanalysis-facilities.json。市境・東海道線で利用先を切らない。
+type TrainStation = { name: string; lat: number; lng: number };
+
+// 藤沢市公式の「交通空白地」定義（メンター自治体との協議に基づき、バス停400m・鉄道駅800mの基準に変更）:
+// 「鉄道駅から800m圏、バス停から400m圏（徒歩10分／5分を考慮した基準）に入らないエリア」。
+// このPoCでは傾斜込みの実効距離をこの2つの閾値と比較し、どちらか一方でも満たせば
+// 「カバーされている」と判定する（OR条件）。詳細はAGENTS.md「藤沢市の距離基準を参考にした独自推計への
+// 切替について」参照。
+const STATION_COVERAGE_THRESHOLD_METERS = 800;
+const BUS_COVERAGE_THRESHOLD_METERS = 400;
+
+// 藤沢市内でJR東海道本線はほぼ東西に走っているため、経度ごとに路線の緯度を線形補間し、
+// 建物の緯度がそれを上回れば「北側」と判定する簡易ロジック（バス停データの北部抽出時と同じ考え方。
+// 対象エリアが限定的なので全国精度は不要という`isOnLand`的な方針を踏襲）。
+// 元データはOverpass APIのJR東海道本線wayジオメトリ（241点）を61点に間引いたもの（最大誤差約14m）。
+const TOKAIDO_LINE_JSON_URL = "/data/tokaido-line.json";
+
+// 建物属性`bldg:usage`にこの文字列を含む場合を住宅系とみなす（共同住宅・住宅・店舗等併用住宅・
+// 店舗等併用共同住宅など、PLATEAU仕様の用途区分は「住宅」を含む表記に統一されているため）。
+const RESIDENTIAL_USAGE_SUBSTRING = "住宅";
+
+// 傾斜込みアクセシビリティスコアを計算する住宅系建物の上限数。全建物を処理すると
+// 地形サンプリング(sampleTerrainMostDetailed)の呼び出しが増えて重くなるため上限を設ける。
+// この上限はグローバル・恒久的（一度使い切ると解放されない）なので、低すぎると
+// 「最初にタイルが読み込まれたエリア（初期カメラが広域なため、たまたま先に読み込まれた
+// エリア）だけが色付けされ、それ以外のエリアはいつまで待っても色付けされない」という
+// 分かりにくい不具合になる（1200だった当初これが実際に発生した。詳細はAGENTS.md参照）。
+// 藤沢市全体の建物3D Tilesは約700タイルで、住宅系×北部に絞ればこの値に達することは
+// まず無い想定だが、将来的に上限に達するようなら「カメラから遠い建物のキャッシュを
+// 間引く」等のエビクション戦略への切り替えを検討すること。
+const MAX_SCORED_BUILDINGS = 80000;
+// 建物〜最寄りバス停の直線を何点でサンプリングして傾斜を求めるか（区間数はこの値-1）。
+const SLOPE_SAMPLE_COUNT = 5;
+// 地形データのノイズで極端な勾配が出た場合の上限（40%勾配で頭打ち）。プロファイルに関わらず共通。
+const SLOPE_GRADIENT_CAP = 0.4;
+
+// 勾配への感度・歩行速度を「一般」「高齢者（坂道に配慮）」の2プロファイルで切り替えられるようにする。
+// 【追加の経緯】メンター自治体（藤沢市、丹野氏）から「北部エリアは高齢化率が加速している地域なので、
+// 年齢層に応じた交通空白地の考え方（高低差の重み付け）があってよいのでは」という提案を受けて実装。
+// 【重要な注記】ここの係数は医学的・工学的な実測値に基づくものではなく、あくまで目安の設定である:
+// - walkSpeedMPerMin: 高齢者の分速50m（時速3km）は、バリアフリー設計で参考にされることが多い一般的な値
+// - slopePenaltyFactor: 「坂道への負荷が一般よりも大きい」という定性的な方向性を、一般の2倍という
+//   単純な係数で表現しただけで、根拠となる調査データがあるわけではない
+// 実務利用の際は、藤沢市側の知見（バス・鉄道担当者と共有予定とのこと）を踏まえて調整することを想定している。
+const WALK_PROFILE_DEFAULT: WalkProfile = "general";
+
+// 【feature/road-network-distanceブランチ限定・実験的】直線距離モデル（デフォルト、mainと同じ
+// ライブ計算）と、道路網距離モデル（scripts/road-network/で事前計算したbuilding-network-scores.json
+// を読み込むだけ）を、ブラウザ上で切り替えて見比べられるようにするためのトグル。
+// ユーザーから「別ブランチで動かしたら空白地の色付けがどれくらい変わるのか見たい」との要望を受けて、
+// mainとブランチを行き来せず同じ画面上で比較できるよう追加した（あくまで視覚比較用の一時的な
+// 実装であり、本採用するかどうかは別途判断する）。
+// 【feature/road-network-distanceブランチ限定・実験的】道路網距離は直線距離より系統的に長くなる
+// ため、直線距離モデルと同じ400m/800mの閾値をそのまま道路網距離に適用すると判定が「厳しすぎる」
+// のでは、という丹野氏からの指摘（2026年8月）を受けて追加。道路網距離モデルの閾値にだけ
+// 調整可能な倍率をかけられるようにする（直線距離モデルは藤沢市公式定義との比較用の
+// ベースラインとして、常に固定の400m/800mのまま変更しない）。
+const NETWORK_THRESHOLD_MULTIPLIER_DEFAULT = 1.4;
+
+// 建物ごとの「カバー率」= min(バス実効距離/BUS_COVERAGE_THRESHOLD_METERS, 駅実効距離/
+// STATION_COVERAGE_THRESHOLD_METERS)。閾値の単位（400m/800m）が異なる駅・バスの2つの基準を
+// ORで比較するための正規化で、ratio<=1ならどちらか一方の基準を満たす＝「カバーされている」。
+// 【2026年8月・3段階に統合】当初はratio>1の超過分を赤系4段階（僅かに超過/やや遠い/遠い/
+// 非常に遠い）に分けていたが、実データで集計したところ「やや遠い」「遠い」に該当する建物は
+// 合わせて全体の6.3%しかなく（僅かに超過12.7%・非常に遠い0.2%に対して桁が違う）、実機で
+// 見ても2色（僅かに超過の薄いピンクと、非常に遠いの暗い赤）にほとんどのケースが収まって見え、
+// 中間2色にはめったに遭遇しないという指摘を受けた。中間2段階を「非常に遠い」側に統合し、
+// 緑1色＋赤系2段階（僅かに超過/非常に遠い）のシンプルな構成にした。
+const COVERAGE_RANKS: { maxRatio: number; legendLabel: string; color: Cesium.Color }[] = [
+  { maxRatio: 1, legendLabel: "カバーされている", color: Cesium.Color.fromCssColorString("#22c55e") },
+  { maxRatio: 1.5, legendLabel: "空白地（僅かに超過）", color: Cesium.Color.fromCssColorString("#fecaca") },
+  { maxRatio: Infinity, legendLabel: "空白地（非常に遠い）", color: Cesium.Color.fromCssColorString("#7f1d1d") },
+];
+
+// 任意地点に自由配置した仮設停留所によって新たにカバー圏内に入った建物のハイライト色（水色）。
+// 既存の緑（最初からカバー済み）と視覚的に区別し、「今回の停留所追加でどの建物が救われたか」が
+// 地図上で一目で分かるようにする。
+const NEWLY_COVERED_BUILDING_COLOR_HEX = "#38bdf8";
+const NEWLY_COVERED_BUILDING_COLOR = Cesium.Color.fromCssColorString(NEWLY_COVERED_BUILDING_COLOR_HEX);
+const CUSTOM_STOP_PIN_COLOR_HEX = "#0284c7";
+
+function colorForCoverageRatio(ratio: number): Cesium.Color {
+  const rank = COVERAGE_RANKS.find((r) => ratio <= r.maxRatio) ?? COVERAGE_RANKS[COVERAGE_RANKS.length - 1];
+  return rank.color;
+}
+
+
+function lineLatAtLon(points: [number, number][], lon: number): number {
+  if (lon <= points[0][0]) return points[0][1];
+  if (lon >= points[points.length - 1][0]) return points[points.length - 1][1];
+  for (let i = 0; i < points.length - 1; i++) {
+    const [lon1, lat1] = points[i];
+    const [lon2, lat2] = points[i + 1];
+    if (lon1 <= lon && lon <= lon2) {
+      if (lon2 === lon1) return (lat1 + lat2) / 2;
+      const t = (lon - lon1) / (lon2 - lon1);
+      return lat1 + t * (lat2 - lat1);
+    }
+  }
+  return points[points.length - 1][1];
+}
+
+function isNorthOfTokaidoLine(points: [number, number][], lng: number, lat: number): boolean {
+  if (points.length === 0) return false;
+  return lat > lineLatAtLon(points, lng);
+}
+
+type BuildingScoreInfo = {
+  usage: string;
+  lat: number;
+  lng: number;
+  nearestStopName: string;
+  busStraightDistanceMeters: number;
+  busEffectiveDistanceMeters: number;
+  busWalkMinutes: number;
+  nearestStationName: string;
+  stationStraightDistanceMeters: number;
+  stationEffectiveDistanceMeters: number;
+  stationWalkMinutes: number;
+  coverageRatio: number;
+  isCovered: boolean;
+  totalFloorArea: number | null;
+  walkProfileLabel: string;
+  customStopImprovement?: {
+    stopId: number;
+    stopLabel: string;
+    afterBusEffectiveDistanceMeters: number;
+    afterBusWalkMinutes: number;
+    afterCoverageRatio: number;
+    isNewlyCovered: boolean;
+  };
+  mobilityHubImprovement?: {
+    hubId: number;
+    hubName: string;
+    hubAddress: string;
+    hubDistanceMeters: number;
+    modeLabel: string;
+  };
+};
+
+// 乗り場増設案の比較結果。候補地点を一つずつクリックしなくても、追加数ごとの
+// 改善度を確認できるようにする。
+// 2点間の傾斜込み実効距離を計算する共通ロジック。住宅系建物の色分け（最寄りバス停まで）と、
+// デマンド交通乗り場候補の「もしここに乗り場を新設したら」の再計算の両方で使う
+// （後者は単に目的地を既存バス停群からクラスタ重心に差し替えて同じ関数を呼ぶだけでよい）。
+type EffectiveDistancePair = { originLat: number; originLng: number; destLat: number; destLng: number };
+type EffectiveDistanceResult = { straightDistanceMeters: number; effectiveDistanceMeters: number };
+
+async function computeEffectiveDistances(
+  terrainProvider: Cesium.TerrainProvider,
+  pairs: EffectiveDistancePair[],
+  slopePenaltyFactor: number
+): Promise<EffectiveDistanceResult[]> {
+  const straightDistances = pairs.map((p) => haversineMeters(p.originLat, p.originLng, p.destLat, p.destLng));
+
+  // 各ペアの直線をSLOPE_SAMPLE_COUNT点でサンプリングし、まとめて1回のsampleTerrainMostDetailedで
+  // 標高を取得する（ペアごとに個別に呼ぶとリクエストが増えて遅くなるため）。
+  const allSamples: Cesium.Cartographic[] = [];
+  const sampleRanges: [number, number][] = [];
+  pairs.forEach((p) => {
+    const start = allSamples.length;
+    for (let s = 0; s < SLOPE_SAMPLE_COUNT; s++) {
+      const t = s / (SLOPE_SAMPLE_COUNT - 1);
+      const lng = p.originLng + (p.destLng - p.originLng) * t;
+      const lat = p.originLat + (p.destLat - p.originLat) * t;
+      allSamples.push(Cesium.Cartographic.fromDegrees(lng, lat));
+    }
+    sampleRanges.push([start, start + SLOPE_SAMPLE_COUNT]);
+  });
+
+  const sampled = await Cesium.sampleTerrainMostDetailed(terrainProvider, allSamples);
+
+  return pairs.map((_, idx) => {
+    const straightDistanceMeters = straightDistances[idx];
+    const [start, end] = sampleRanges[idx];
+    const heights = sampled.slice(start, end).map((carto) => carto.height);
+    if (heights.some(height => !Number.isFinite(height))) throw new Error("地形の標高が欠測しています");
+    const segmentDistance = straightDistanceMeters / (SLOPE_SAMPLE_COUNT - 1);
+    let effectiveDistanceMeters = 0;
+    for (let k = 0; k < heights.length - 1; k++) {
+      const rise = Math.abs(heights[k + 1] - heights[k]);
+      const gradient = Math.min(rise / Math.max(segmentDistance, 1), SLOPE_GRADIENT_CAP);
+      effectiveDistanceMeters += segmentDistance * (1 + slopePenaltyFactor * gradient);
+    }
+    return { straightDistanceMeters, effectiveDistanceMeters };
+  });
+}
+
+// デマンド交通乗り場候補は、藤沢市公式の交通空白地判定（COVERAGE_RANKS参照）でカバーされていない
+// 住宅系建物を対象にする。候補抽出の母集団は公式基準の1.0倍に固定する。以前は「深刻度」を
+// 絞り込むスライダーを設けていたが、比較分析の実効距離基準と意味が近く、操作軸が増えて
+// 分かりにくくなるため廃止した。
+const DEMAND_TRANSIT_GAP_RATIO_THRESHOLD = 1.0;
+const DEMAND_TRANSIT_CLUSTER_COUNT_DEFAULT = 4;
+// 比較分析では、実効距離に対してバス400m・駅800mをそのまま適用するか、坂道等による
+// 上乗せを見込んで何倍まで許容するかを別途選べるようにする。これは地図の独自推計を
+// 変えるものではなく、乗り場追加案の感度分析専用の条件である。
+// 徒歩経路の一般的な迂回率（約1.2）を、比較分析の初期条件に採用する。
+const DEMAND_TRANSIT_ANALYSIS_THRESHOLD_MULTIPLIER_DEFAULT = 1.2;
+// クラスタリング対象の建物数がこれ未満なら候補地点を出さない（サンプルが少なすぎて
+// 「クラスタ」と呼べる状態にならないため）。
+const DEMAND_TRANSIT_MIN_BUILDINGS = 8;
+// 建物のスコア計算が進むたびに毎回再クラスタリングすると重いので、最後の更新から
+// このミリ秒だけ間隔が空いたら再計算する（デバウンス）。
+const DEMAND_TRANSIT_RECOMPUTE_DEBOUNCE_MS = 1500;
+const DEMAND_TRANSIT_COLOR = "#a855f7";
+
+// 地図上の位置関係を土地勘なしでも把握できるようにするための、藤沢市北部の駅・地区名ラベル。
+// 当初は8件をソース直書きしていたが、「もっと各所に地名を表示したい」というフィードバックを受けて
+// バス停・東海道線データと同じOverpass抽出パターンに切り替えた（詳細はAGENTS.md参照）。
+// 駅（railway=station/halt）と地区名（place=neighbourhood/quarter、丁目サフィックスを除去して
+// 大字・地区単位に統合、既存のisNorthOfTokaidoLineと同じロジックで北部のみに絞り込み済み）を
+// Overpassでまとめて抽出し、public/data/place-labels.json に保存してある。
+const PLACE_LABELS_JSON_URL = "/data/place-labels.json";
+type PlaceLabel = { name: string; lat: number; lng: number };
+
+// 藤沢市が既に運行している乗合タクシー・オンデマンドバス（天神町AIオンデマンドバス、のりあい善行）を、
+// このPoCが提案する「デマンド交通乗り場候補」（紫の四角ピン）と区別できる形で地図上にオーバーレイ
+// 表示する。「このPoCは市の既存の取り組みと無関係に候補を出しているのではなく、市がまだ手を
+// 付けていない場所を見つけるための優先順位付けツールである」ことを示すための機能。
+// 【2026年8月・実際の停留所群を使う方式に変更】当初は各サービスにつき1点（中心座標・半径から
+// 算出した概算エリア）のみを表示していたが、「実際にはいくつも停留所があるはずなのに1つしか
+// 表示されていないのでは」という指摘を受けて見直した。調べたところ、天神町AIオンデマンドバス
+// （既存の路線バス「天神町循環線」をAIオンデマンド化したもの）は`public/data/bus-stops.json`内の
+// 「天神町」始まりの停留所10件（神奈川中央交通）として、のりあい善行も同ファイル内の事業者名
+// 「善行地区郷土づくり推進会議」の17件として、**どちらも国土数値情報P11データにそのまま
+// 実在する**ことが分かった（のりあい善行の公式路線図PDFと突き合わせ、01系統8件・02系統11件
+// ＝重複除く17件の停留所名が完全一致することを確認済み）。そのため、概算の中心・半径を
+// 算出する必要が無くなり、`public/data/existing-demand-transit.json`の各サービスに実際の
+// 停留所一覧（`stops`）をそのまま持たせる方式に変更した。
+// 【同時に対応済み】「おでかけ六会」は2024年11月29日をもって収支悪化により運行終了（ユーザー
+// からの報告。藤沢市の地域公共交通ページ・のりあい善行ページのいずれにも記載が無くなっている
+// ことをWeb検索で確認したが、終了を明記した一次情報＝正式な告知文までは見つけられていない）。
+// 運行終了済みのサービスを現役のオーバーレイとして表示し続けるのは誤解を招くため、データから削除した。
+const EXISTING_DEMAND_TRANSIT_JSON_URL = "/data/existing-demand-transit.json";
+type ExistingDemandTransitStop = { name: string; lat: number; lng: number };
+type ExistingDemandTransitService = {
+  name: string;
+  type: string;
+  operator: string;
+  startDate: string;
+  description: string;
+  sourceUrl: string;
+  stops: ExistingDemandTransitStop[];
+};
+const EXISTING_DEMAND_TRANSIT_COLOR = Cesium.Color.fromCssColorString("#a855f7");
+
+// ハローサイクリング（OpenStreet株式会社）のシェアサイクルステーションを地図上に表示する。
+// データ出典: ODPT（公共交通オープンデータセンター）のGBFS形式データ。GTFS-JPと違い
+// 「公共交通オープンデータチャレンジ2026限定ライセンス」の対象外で、通常のODPTセンター
+// アクセストークンで取得できる常時公開データ（詳細はREADME.mdのクレジット表記参照）。
+// ライセンス: CC BY 4.0 / ODC BY 1.0 / ODbL 1.0。
+// アクセストークンをクライアントに露出させないよう、/api/hellocycling-stations
+// （サーバーサイドプロキシ）経由で取得する。北部エリアへの絞り込み（バウンディングボックス＋
+// 東海道線より北）もこのAPIルート側で行っている。
+// 【現段階のスコープ】表示のみで、coverageRatio等の色分けロジックには組み込んでいない
+// （ユーザーからの明示的な指示）。
+const HELLO_CYCLING_STATIONS_API_URL = "/api/hellocycling-stations";
+type HelloCyclingStation = { id: string; name: string; lat: number; lng: number; capacity: number | null };
+const HELLO_CYCLING_COLOR = "#facc15";
+
+// 対象エリアが藤沢市北部（東西南北とも十数km程度）に限られるため、緯度経度を
+// 単純な等距円筒図法でメートル相当のローカルXY座標に変換して使う（k-meansのユークリッド距離が
+// 経度方向で不当に圧縮/伸長されるのを避けるため。全国精度は不要という他の判定と同じ方針）。
+function createSquareIconDataUrl(fillColor: string, size = 28): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  ctx.fillStyle = fillColor;
+  ctx.fillRect(3, 3, size - 6, size - 6);
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(3, 3, size - 6, size - 6);
+  return canvas.toDataURL();
+}
+
+// 既存の乗合タクシー・オンデマンドバスの拠点ピンを、デマンド交通候補（紫の四角）・バス停（丸だが
+// 小さい）と見た目で区別するため、円形のアイコンを生成する（四角=このPoCの提案、丸=市の既存実績、
+// という視覚的な対比を意図している）。
+function createCircleIconDataUrl(fillColor: string, size = 28): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  const center = size / 2;
+  const radius = size / 2 - 3;
+  ctx.beginPath();
+  ctx.arc(center, center, radius, 0, Math.PI * 2);
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  return canvas.toDataURL();
+}
+
+// ハローサイクリングのステーションピンを、バス停（丸）・既存デマンド交通（青丸）と見た目で
+// 区別するため、黄色い円に自転車の絵文字を重ねたアイコンを生成する。
+function createBicycleIconDataUrl(fillColor: string, size = 28): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  const center = size / 2;
+  const radius = size / 2 - 3;
+  ctx.beginPath();
+  ctx.arc(center, center, radius, 0, Math.PI * 2);
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.font = `${Math.round(size * 0.6)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("🚲", center, center + 1);
+  return canvas.toDataURL();
+}
+
+// 自由配置した仮設停留所ピン（水色系の丸＋白い番号テキスト）をcanvasで生成する。
+function createCustomStopPinIconDataUrl(
+  labelNumber: number,
+  fillColor = CUSTOM_STOP_PIN_COLOR_HEX,
+  size = 30
+): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  const center = size / 2;
+  const radius = size / 2 - 3;
+  ctx.beginPath();
+  ctx.arc(center, center, radius, 0, Math.PI * 2);
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = `bold ${labelNumber >= 10 ? 12 : 14}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(labelNumber), center, center + 1);
+  return canvas.toDataURL();
+}
+
+// モビリティ・ハブ候補地ピン（アンバー/オレンジ系の丸＋白いH1〜H4テキスト）をcanvasで生成する。
+const MOBILITY_HUB_PIN_COLOR_HEX = "#f59e0b";
+function createMobilityHubPinIconDataUrl(
+  hubId: number,
+  fillColor = MOBILITY_HUB_PIN_COLOR_HEX,
+  size = 32
+): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  const center = size / 2;
+  const radius = size / 2 - 3;
+  ctx.beginPath();
+  ctx.arc(center, center, radius, 0, Math.PI * 2);
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 13px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(`H${hubId}`, center, center + 1);
+  return canvas.toDataURL();
+}
+
+// 画面上のクリック位置から地形表面（未ロード時は楕円体表面）の緯度経度を取得する。
+// viewer.scene.pickPositionは3D Tilesの建物屋根を拾ったり深度設定で空振りすることがあるため、
+// camera.getPickRay + globe.pick を優先し、フォールバックに pickEllipsoid を使う。
+function pickGroundLatLng(
+  viewer: Cesium.Viewer,
+  windowPosition: Cesium.Cartesian2
+): { lat: number; lng: number } | null {
+  const ray = viewer.camera.getPickRay(windowPosition);
+  let cartesian: Cesium.Cartesian3 | undefined;
+  if (ray) {
+    cartesian = viewer.scene.globe.pick(ray, viewer.scene);
+  }
+  if (!cartesian) {
+    cartesian = viewer.camera.pickEllipsoid(windowPosition, viewer.scene.globe.ellipsoid);
+  }
+  if (!cartesian) return null;
+  const carto = Cesium.Cartographic.fromCartesian(cartesian);
+  return {
+    lat: Cesium.Math.toDegrees(carto.latitude),
+    lng: Cesium.Math.toDegrees(carto.longitude),
+  };
+}
+
+type SaveFilePickerWindow = Window & {
+  showSaveFilePicker?: (options?: {
+    suggestedName?: string;
+    types?: Array<{
+      description?: string;
+      accept: Record<string, string[]>;
+    }>;
+  }) => Promise<{
+    createWritable: () => Promise<{
+      write: (data: Blob) => Promise<void>;
+      close: () => Promise<void>;
+    }>;
+  }>;
+};
+
+function formatExportTimestamp(date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+/**
+ * GeoJSONデータをファイル保存する。
+ * 対応ブラウザ（Chrome / Edge 等）では保存先・ファイル名を選択できるOSダイアログを開き、
+ * 非対応ブラウザ（Safari / Firefox 等）では従来のダウンロード方式へフォールバックする。
+ */
+async function saveGeoJsonFile(geoJson: unknown, fileName: string): Promise<void> {
+  const jsonStr = JSON.stringify(geoJson, null, 2);
+  const blob = new Blob([jsonStr], { type: "application/geo+json;charset=utf-8" });
+  const picker = (window as SaveFilePickerWindow).showSaveFilePicker;
+
+  if (typeof picker === "function") {
+    try {
+      const handle = await picker({
+        suggestedName: fileName,
+        types: [
+          {
+            description: "GeoJSON ファイル",
+            accept: { "application/json": [".geojson"] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (err) {
+      // ユーザーが保存ダイアログをキャンセルした場合は何もせず終了する
+      if ((err as { name?: unknown } | null)?.name === "AbortError") {
+        return;
+      }
+      // 制限環境等でダイアログが開けない場合のみ従来方式へフォールバックする
+      console.warn("showSaveFilePicker での保存に失敗したため、通常ダウンロードへ切り替えます:", err);
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+type PopupInfo = { title: string; lines: ReactNode[] };
+
+// Cesium標準のinfoBox/selectionIndicatorは無効化している（下記Viewer初期化オプション参照）ため、
+// バス停クリック時の情報表示はこの自前ポップアップで行う。
+function InfoPopup({ info, onClose }: { info: PopupInfo; onClose: () => void }) {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        right: 12,
+        top: 12,
+        zIndex: 15,
+        background: "rgba(20, 20, 20, 0.9)",
+        color: "#fff",
+        padding: "10px 14px",
+        borderRadius: 6,
+        fontSize: 13,
+        lineHeight: 1.6,
+        fontFamily: "sans-serif",
+        maxWidth: 320,
+        maxHeight: "calc(100vh - 110px)",
+        overflowY: "auto",
+        boxShadow: "0 4px 16px rgba(0, 0, 0, 0.5)",
+        border: "1px solid rgba(255, 255, 255, 0.15)",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+        <div style={{ fontWeight: "bold" }}>{info.title}</div>
+        <button
+          onClick={onClose}
+          aria-label="閉じる"
+          style={{
+            background: "none",
+            border: "none",
+            color: "#fff",
+            fontSize: 16,
+            lineHeight: 1,
+            cursor: "pointer",
+            padding: 0,
+          }}
+        >
+          ×
+        </button>
+      </div>
+      {info.lines.map((line, i) => (
+        <div key={i}>{line}</div>
+      ))}
+    </div>
+  );
+}
+
+// 将来的に自動抽出の乗り場候補ピン（紫）・全域比較グラフ・ハローサイクリング表示を
+// 復活させる場合の表示切り替えフラグ（内部ロジックはそのまま保持）。
+const SHOW_AUTO_CANDIDATE_AND_COMPARISON_UI = false;
+const SHOW_HELLO_CYCLING_UI = false;
+
+function Legend({
+  clusterCount,
+  analysisThresholdMultiplier,
+  showHelloCycling,
+  walkProfile,
+  distanceModel,
+  loadingNetworkScores,
+  networkThresholdMultiplier,
+  showExperimentalDistanceModel,
+  onClusterCountChange,
+  onAnalysisThresholdMultiplierChange,
+  onShowHelloCyclingChange,
+  onWalkProfileChange,
+  onDistanceModelChange,
+  onNetworkThresholdMultiplierChange,
+  onToggleExperimentalDistanceModel,
+  isDemandTransitAnalysisRunning,
+  isDemandTransitPanelVisible,
+  onShowDemandTransitPanel,
+  isAddingCustomStop,
+  customStopCount,
+  customStopNewlyCoveredCount,
+  isMobilityHubActive,
+  onToggleMobilityHubActive,
+  mobilityHubRescuedCount,
+  mobilityHubRescuedArea,
+  isCollapsed,
+  onToggleCollapsed,
+  onToggleAddingCustomStop,
+  onClearCustomStops,
+}: {
+  clusterCount: number;
+  analysisThresholdMultiplier: number;
+  showHelloCycling: boolean;
+  walkProfile: WalkProfile;
+  distanceModel: DistanceModel;
+  loadingNetworkScores: boolean;
+  networkThresholdMultiplier: number;
+  showExperimentalDistanceModel: boolean;
+  onClusterCountChange: (value: number) => void;
+  onAnalysisThresholdMultiplierChange: (value: number) => void;
+  onShowHelloCyclingChange: (value: boolean) => void;
+  onWalkProfileChange: (value: WalkProfile) => void;
+  onDistanceModelChange: (value: DistanceModel) => void;
+  onNetworkThresholdMultiplierChange: (value: number) => void;
+  onToggleExperimentalDistanceModel: (value: boolean) => void;
+  isDemandTransitAnalysisRunning: boolean;
+  isDemandTransitPanelVisible: boolean;
+  onShowDemandTransitPanel: () => void;
+  isAddingCustomStop: boolean;
+  customStopCount: number;
+  customStopNewlyCoveredCount: number;
+  isMobilityHubActive: boolean;
+  onToggleMobilityHubActive: () => void;
+  mobilityHubRescuedCount?: number;
+  mobilityHubRescuedArea?: number;
+  isCollapsed: boolean;
+  onToggleCollapsed: () => void;
+  onToggleAddingCustomStop: () => void;
+  onClearCustomStops: () => void;
+}) {
+  // 折りたたみ見出しのホバー時ハイライト用。クリック可能であることを視覚的に伝えるため
+  // （見出しだけを見てもクリックできると分かりにくい、という指摘への対応）。
+  const [experimentalHeaderHovered, setExperimentalHeaderHovered] = useState(false);
+  const [showSlopeCalculationModal, setShowSlopeCalculationModal] = useState(false);
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: 12,
+        top: 12,
+        zIndex: 10,
+        background: "rgba(20, 20, 20, 0.75)",
+        color: "#fff",
+        padding: "10px 12px",
+        borderRadius: 6,
+        fontSize: 12,
+        lineHeight: 1.5,
+        fontFamily: "sans-serif",
+        // デマンド交通の閾値・候補数スライダーを操作できるようにする必要があるため、
+        // UncoloredBuildingsNote等の純粋な装飾パネルとは異なりpointerEventsを有効にしている
+        // （画面左上の固定サイズの小さな箱の中だけなので、他の地図操作の妨げにはならない）。
+        pointerEvents: "auto",
+        // maxWidthを明示しないと、幅制約の無い長文（距離モデルの説明文など）を子要素に
+        // 追加したときに、absolute配置のshrink-to-fit計算でパネル全体が画面横幅いっぱいまで
+        // 広がってしまう不具合が実際に発生した。他のパネル（InfoPopup/CoverageStatsPanel）と
+        // 同様にmaxWidthで頭打ちにしておく。
+        maxWidth: 320,
+        maxHeight: "calc(100vh - 32px)",
+        overflowY: "auto",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8, marginBottom: isCollapsed ? 0 : 4 }}>
+        <div
+          onClick={onToggleCollapsed}
+          style={{ cursor: "pointer", flex: 1, userSelect: "none" }}
+        >
+          <div style={{ fontWeight: "bold", fontSize: 13 }}>藤沢市北部 交通空白地推計</div>
+          {isCollapsed && (
+            <div
+              style={{
+                fontSize: 11,
+                color: isAddingCustomStop || customStopCount > 0 ? "#38bdf8" : "#94a3b8",
+                marginTop: 2,
+              }}
+            >
+              {isAddingCustomStop
+                ? "📍 停留所配置中（凡例・設定を展開）"
+                : customStopCount > 0
+                ? "📊 シミュレーション結果表示中（凡例・設定を展開）"
+                : "クリックまたは右のボタンで凡例と設定を展開"}
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          aria-label={isCollapsed ? "凡例パネルを展開" : "凡例パネルを折りたたむ"}
+          title={isCollapsed ? "展開する" : "折りたたむ"}
+          onClick={onToggleCollapsed}
+          style={{
+            border: "1px solid rgba(148, 163, 184, 0.4)",
+            borderRadius: 4,
+            background: "rgba(255, 255, 255, 0.08)",
+            color: "#cbd5e1",
+            fontSize: 11,
+            lineHeight: 1,
+            cursor: "pointer",
+            padding: "4px 6px",
+            whiteSpace: "nowrap",
+            flexShrink: 0,
+          }}
+        >
+          {isCollapsed ? "▼ 展開" : "▲ 縮小"}
+        </button>
+      </div>
+      {!isCollapsed && (
+        <>
+          <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 4 }}>
+            バス停400m／鉄道駅800mを参考に、地形勾配と歩行負荷の補正を加えて判定しています（市の公式判定そのものではありません）。交通施設は市境・東海道線の外側も含む周辺矩形から抽出。駅は代表点を使用し、運行頻度は考慮していません。
+          </div>
+      {COVERAGE_RANKS.map((rank) => (
+        <div key={rank.legendLabel} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+          <span
+            style={{
+              display: "inline-block",
+              width: 14,
+              height: 14,
+              background: rank.color.toCssColorString(),
+              border: "1px solid rgba(255,255,255,0.6)",
+              flexShrink: 0,
+            }}
+          />
+          <span>{rank.legendLabel}</span>
+        </div>
+      ))}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+        <span
+          style={{
+            display: "inline-block",
+            width: 14,
+            height: 14,
+            background: NEWLY_COVERED_BUILDING_COLOR_HEX,
+            border: "1px solid rgba(255,255,255,0.6)",
+            flexShrink: 0,
+          }}
+        />
+        <span>新規カバー（自由配置した停留所で解消）</span>
+      </div>
+      {isMobilityHubActive && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+          <span
+            style={{
+              display: "inline-block",
+              width: 14,
+              height: 14,
+              background: MOBILITY_HUB_PIN_COLOR_HEX,
+              border: "1px solid rgba(255,255,255,0.6)",
+              flexShrink: 0,
+            }}
+          />
+          <span style={{ color: "#fbbf24", fontWeight: "bold" }}>
+            モビリティ・ハブ救済（オレンジ）
+          </span>
+        </div>
+      )}
+      <div style={{ marginTop: 4 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 3 }}>
+          <span style={{ opacity: 0.85 }}>勾配・歩行速度のプロファイル:</span>
+          <button
+            type="button"
+            onClick={() => setShowSlopeCalculationModal(true)}
+            style={{
+              background: "rgba(56, 189, 248, 0.18)",
+              border: "1px solid rgba(56, 189, 248, 0.45)",
+              color: "#38bdf8",
+              borderRadius: 4,
+              fontSize: 10.5,
+              padding: "1px 6px",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: 3,
+              lineHeight: 1.4,
+              transition: "all 0.15s ease",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(56, 189, 248, 0.3)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "rgba(56, 189, 248, 0.18)")}
+            title="勾配ペナルティ係数と上り坂割増の計算根拠を見る"
+          >
+            <span style={{ fontSize: 11 }}>ℹ️</span>
+            <span>計算のしくみ</span>
+          </button>
+        </div>
+        {(Object.keys(WALK_PROFILES) as WalkProfile[]).map((key) => (
+          <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+            <input
+              type="radio"
+              name="walkProfile"
+              checked={walkProfile === key}
+              onChange={() => onWalkProfileChange(key)}
+            />
+            <span>{WALK_PROFILES[key].label}</span>
+          </label>
+        ))}
+      </div>
+      <div style={{ marginTop: 4 }}>
+        {/* 初見の審査員が「別の判定基準がある」と誤解しないよう、既定で折りたたんでおく
+            （detailsではなくdivクリックで開閉するのは、他のLegend要素とスタイルを揃えるため）。
+            クリックできることが伝わりにくいという指摘を受け、一般的なアコーディオンの見た目
+            （ホバーで背景が変わる・矢印を大きく目立つ色にする・「クリックで詳細」の一言を
+            添える）に寄せた。 */}
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => onToggleExperimentalDistanceModel(!showExperimentalDistanceModel)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") onToggleExperimentalDistanceModel(!showExperimentalDistanceModel);
+          }}
+          onMouseEnter={() => setExperimentalHeaderHovered(true)}
+          onMouseLeave={() => setExperimentalHeaderHovered(false)}
+          style={{
+            marginBottom: 2,
+            marginLeft: -4,
+            marginRight: -4,
+            padding: "3px 4px",
+            borderRadius: 4,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: 5,
+            userSelect: "none",
+            background: experimentalHeaderHovered ? "rgba(255,255,255,0.14)" : "transparent",
+            transition: "background 0.1s ease",
+          }}
+        >
+          <span style={{ fontSize: 13, color: "#6ecbf5", fontWeight: "bold", lineHeight: 1 }}>
+            {showExperimentalDistanceModel ? "▼" : "▶"}
+          </span>
+          <span style={{ opacity: 0.9 }}>距離モデル（直線／道路網・クリックで詳細）</span>
+        </div>
+        {showExperimentalDistanceModel && (
+          <>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="distanceModel"
+                checked={distanceModel === "straight"}
+                disabled={loadingNetworkScores}
+                onChange={() => onDistanceModelChange("straight")}
+              />
+              <span>直線距離（既定の判定基準）</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+              <input
+                type="radio"
+                name="distanceModel"
+                checked={distanceModel === "network"}
+                disabled={loadingNetworkScores}
+                onChange={() => onDistanceModelChange("network")}
+              />
+              <span>道路網距離{loadingNetworkScores ? "（読み込み中…）" : ""}</span>
+            </label>
+            <div
+              style={{
+                fontSize: 10.5,
+                opacity: 0.75,
+                marginTop: 4,
+                padding: "4px 6px",
+                background: "rgba(255,255,255,0.08)",
+                borderRadius: 4,
+              }}
+            >
+              「道路網距離」に切り替えると、実際の歩行道路に沿った迂回距離で再評価でき、直線距離では圏内と判定されていた建物のうち、実態として交通空白地に該当するエリアを確認できます。
+            </div>
+            <div style={{ marginTop: 6, opacity: distanceModel === "network" ? 1 : 0.5 }}>
+              <label style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                <span>道路網距離モデルの判定基準の緩和倍率: {networkThresholdMultiplier.toFixed(1)}倍</span>
+              </label>
+              <input
+                type="range"
+                min={1}
+                max={1.5}
+                step={0.1}
+                value={networkThresholdMultiplier}
+                disabled={distanceModel !== "network"}
+                onChange={(e) => onNetworkThresholdMultiplierChange(Number(e.target.value))}
+                style={{ width: "100%" }}
+              />
+              <div style={{ fontSize: 10.5, opacity: 0.75, marginTop: 2 }}>
+                道路網距離は直線距離より系統的に長くなるため、バス停400m・鉄道駅800mの参考基準にこの倍率をかけて判定を緩和できます（直線距離モデルは400m／800mの閾値で固定）。
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+      <div style={{ borderTop: "1px solid rgba(255,255,255,0.3)", margin: "8px 0 6px" }} />
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+        <span
+          style={{
+            display: "inline-block",
+            width: 12,
+            height: 12,
+            borderRadius: "50%",
+            background: BUS_STOP_COLOR.toCssColorString(),
+            border: "1px solid rgba(255,255,255,0.6)",
+            flexShrink: 0,
+          }}
+        />
+        <span>バス停（神奈川中央交通・江ノ電バス。色分け計算に使用）</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span
+          style={{
+            display: "inline-block",
+            width: 12,
+            height: 12,
+            borderRadius: "50%",
+            background: BUS_STOP_COLOR_MINOR.toCssColorString(),
+            border: "1px solid rgba(255,255,255,0.6)",
+            flexShrink: 0,
+          }}
+        />
+        <span>バス停（その他事業者・コミュニティバス。参考表示のみ）</span>
+      </div>
+      {SHOW_AUTO_CANDIDATE_AND_COMPARISON_UI && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+          <span
+            style={{
+              display: "inline-block",
+              width: 12,
+              height: 12,
+              background: DEMAND_TRANSIT_COLOR,
+              border: "1px solid rgba(255,255,255,0.6)",
+              flexShrink: 0,
+            }}
+          />
+          <span>デマンド交通 乗り場候補（本PoCの提案）</span>
+        </div>
+      )}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+        <span
+          style={{
+            display: "inline-block",
+            width: 12,
+            height: 12,
+            borderRadius: "50%",
+            background: EXISTING_DEMAND_TRANSIT_COLOR.toCssColorString(),
+            border: "1px solid rgba(255,255,255,0.6)",
+            flexShrink: 0,
+          }}
+        />
+        <span>乗合タクシー等（藤沢市が既に運行中）</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+        <span
+          style={{
+            display: "inline-block",
+            width: 12,
+            height: 12,
+            borderRadius: "50%",
+            background: CUSTOM_STOP_PIN_COLOR_HEX,
+            border: "1.5px solid #ffffff",
+            flexShrink: 0,
+          }}
+        />
+        <span>仮設停留所（地図クリックで自由配置）</span>
+      </div>
+      {SHOW_HELLO_CYCLING_UI && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+          <span
+            style={{
+              display: "inline-block",
+              width: 12,
+              height: 12,
+              borderRadius: "50%",
+              background: HELLO_CYCLING_COLOR,
+              border: "1px solid rgba(255,255,255,0.6)",
+              flexShrink: 0,
+            }}
+          />
+          <span>ハローサイクリング ステーション</span>
+        </div>
+      )}
+      <div
+        style={{
+          marginTop: 10,
+          padding: "9px 10px",
+          borderRadius: 6,
+          background: isAddingCustomStop
+            ? "linear-gradient(180deg, rgba(14, 165, 233, 0.28) 0%, rgba(2, 132, 199, 0.2) 100%)"
+            : "linear-gradient(180deg, rgba(56, 189, 248, 0.16) 0%, rgba(15, 23, 42, 0.5) 100%)",
+          border: isAddingCustomStop
+            ? "2px solid #38bdf8"
+            : "1.5px solid #0284c7",
+          boxShadow: isAddingCustomStop
+            ? "0 0 12px rgba(56, 189, 248, 0.45)"
+            : "0 2px 8px rgba(2, 132, 199, 0.25)",
+        }}
+      >
+        <div style={{ fontWeight: "bold", color: "#38bdf8", fontSize: 12.5, letterSpacing: "0.02em" }}>
+          エリア対策シミュレーション（自由配置）
+        </div>
+        <div style={{ fontSize: 10.5, color: "#cbd5e1", marginTop: 3 }}>
+          地図をクリックして任意の場所に停留所を複数配置し、カバー建物の変化を確認できます。
+        </div>
+        <button
+          type="button"
+          onClick={onToggleAddingCustomStop}
+          style={{
+            width: "100%",
+            marginTop: 7,
+            padding: "7px 8px",
+            border: isAddingCustomStop ? "1.5px solid #bae6fd" : "1px solid #38bdf8",
+            borderRadius: 4,
+            background: isAddingCustomStop
+              ? "linear-gradient(180deg, #0284c7 0%, #0369a1 100%)"
+              : "linear-gradient(180deg, rgba(2, 132, 199, 0.7) 0%, rgba(3, 105, 161, 0.7) 100%)",
+            color: "#fff",
+            fontWeight: "bold",
+            fontSize: 12,
+            cursor: "pointer",
+            boxShadow: isAddingCustomStop ? "0 0 8px rgba(56, 189, 248, 0.6)" : "none",
+          }}
+        >
+          {isAddingCustomStop ? "シミュレーション中（パネルを表示中）" : "エリア対策シミュレーションを開始"}
+        </button>
+        {customStopCount > 0 && (
+          <div style={{ marginTop: 6, fontSize: 11, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+            <span>
+              配置中: <b>{customStopCount}箇所</b>（新規カバー <b style={{ color: "#38bdf8" }}>+{customStopNewlyCoveredCount}棟</b>）
+            </span>
+            <button
+              type="button"
+              onClick={onClearCustomStops}
+              style={{
+                padding: "2px 7px",
+                fontSize: 10.5,
+                borderRadius: 3,
+                border: "1px solid rgba(255,255,255,0.35)",
+                background: "rgba(255,255,255,0.1)",
+                color: "#fff",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+                flexShrink: 0,
+              }}
+            >
+              クリア
+            </button>
+          </div>
+        )}
+        <div style={{ marginTop: 8, paddingTop: 7, borderTop: "1px solid rgba(125, 211, 252, 0.28)" }}>
+          <label style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 11 }}>
+            <span>
+              カバー判定の実効距離基準:{" "}
+              {distanceModel === "network"
+                ? `${networkThresholdMultiplier.toFixed(1)}倍（道路網基準と連動・バス${Math.round(BUS_COVERAGE_THRESHOLD_METERS * networkThresholdMultiplier)}m圏）`
+                : `${analysisThresholdMultiplier.toFixed(1)}倍（バス${Math.round(BUS_COVERAGE_THRESHOLD_METERS * analysisThresholdMultiplier)}m圏）`}
+            </span>
+          </label>
+          <input
+            type="range"
+            min={1}
+            max={1.5}
+            step={0.1}
+            value={distanceModel === "network" ? networkThresholdMultiplier : analysisThresholdMultiplier}
+            onChange={(e) => {
+              const val = Number(e.target.value);
+              if (distanceModel === "network") {
+                onNetworkThresholdMultiplierChange(val);
+              } else {
+                onAnalysisThresholdMultiplierChange(val);
+              }
+            }}
+            style={{ width: "100%", marginTop: 2 }}
+          />
+          <div style={{ fontSize: 10.5, opacity: 0.82, marginTop: 2 }}>
+            {distanceModel === "network"
+              ? "道路網距離モデル選択中は、道路網の判定緩和倍率と自動で同期します。"
+              : "傾斜補正込みで400m圏は厳しい場合などに緩和できます。変更すると水色のカバー範囲が即座に更新されます。"}
+          </div>
+        </div>
+      </div>
+      <div
+        style={{
+          marginTop: 10,
+          padding: "9px 10px",
+          borderRadius: 6,
+          background: isMobilityHubActive
+            ? "linear-gradient(180deg, rgba(245, 158, 11, 0.28) 0%, rgba(217, 119, 6, 0.2) 100%)"
+            : "linear-gradient(180deg, rgba(245, 158, 11, 0.16) 0%, rgba(15, 23, 42, 0.5) 100%)",
+          border: isMobilityHubActive
+            ? "2px solid #f59e0b"
+            : "1.5px solid #d97706",
+          boxShadow: isMobilityHubActive
+            ? "0 0 12px rgba(245, 158, 11, 0.45)"
+            : "0 2px 8px rgba(217, 119, 6, 0.25)",
+        }}
+      >
+        <div style={{ fontWeight: "bold", color: "#fbbf24", fontSize: 12.5, letterSpacing: "0.02em" }}>
+          モビリティ・ハブ検討（実証候補地）
+        </div>
+        <div style={{ fontSize: 10.5, color: "#cbd5e1", marginTop: 3 }}>
+          藤沢市が実証検討中の候補地4箇所（大庭・遠藤）にシェアサイクル等を導入した場合の救済効果を試算します。
+        </div>
+        <button
+          type="button"
+          onClick={onToggleMobilityHubActive}
+          style={{
+            width: "100%",
+            marginTop: 7,
+            padding: "7px 8px",
+            border: isMobilityHubActive ? "1.5px solid #fef3c7" : "1px solid #f59e0b",
+            borderRadius: 4,
+            background: isMobilityHubActive
+              ? "linear-gradient(180deg, #d97706 0%, #b45309 100%)"
+              : "linear-gradient(180deg, rgba(217, 119, 6, 0.7) 0%, rgba(180, 83, 9, 0.7) 100%)",
+            color: "#fff",
+            fontWeight: "bold",
+            fontSize: 12,
+            cursor: "pointer",
+            boxShadow: isMobilityHubActive ? "0 0 8px rgba(245, 158, 11, 0.6)" : "none",
+          }}
+        >
+          {isMobilityHubActive ? "ハブ検討中（パネルを表示中）" : "モビリティ・ハブ検討を開始"}
+        </button>
+        {isMobilityHubActive && mobilityHubRescuedCount != null && mobilityHubRescuedCount > 0 && (
+          <div style={{ marginTop: 6, fontSize: 11, color: "#fef3c7" }}>
+            救済効果: <b style={{ color: "#fbbf24" }}>+{mobilityHubRescuedCount.toLocaleString()}棟</b>
+            {mobilityHubRescuedArea != null && mobilityHubRescuedArea > 0 && (
+              <span>（延床 約{Math.round(mobilityHubRescuedArea).toLocaleString()}m²）</span>
+            )}
+          </div>
+        )}
+      </div>
+      {SHOW_AUTO_CANDIDATE_AND_COMPARISON_UI && (
+        <>
+          <div style={{ marginTop: 8 }}>
+            <label style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+              <span>乗り場候補の数: {clusterCount}箇所</span>
+            </label>
+            <input
+              type="range"
+              min={1}
+              max={10}
+              step={1}
+              value={clusterCount}
+              onChange={(e) => onClusterCountChange(Number(e.target.value))}
+              style={{ width: "100%" }}
+            />
+          </div>
+          <div style={{ marginTop: 7, color: isDemandTransitAnalysisRunning ? "#d8b4fe" : "rgba(255,255,255,0.7)", fontSize: 11 }}>
+            {isDemandTransitAnalysisRunning ? "比較条件を反映中…" : "この倍率を変えると、比較グラフや自由配置の水色カバーが自動で更新されます。"}
+          </div>
+          {!isDemandTransitPanelVisible && (
+            <button
+              type="button"
+              onClick={onShowDemandTransitPanel}
+              disabled={isDemandTransitAnalysisRunning}
+              style={{
+                width: "100%", marginTop: 6, padding: "5px 8px", border: "1px solid rgba(216,180,254,0.8)",
+                borderRadius: 4, background: isDemandTransitAnalysisRunning ? "rgba(126,34,206,0.25)" : "rgba(126,34,206,0.42)",
+                color: "#fff", fontSize: 11,
+                cursor: isDemandTransitAnalysisRunning ? "wait" : "pointer",
+              }}
+            >
+              {isDemandTransitAnalysisRunning ? "比較データを計算中…" : "比較グラフを表示"}
+            </button>
+          )}
+        </>
+      )}
+      {SHOW_HELLO_CYCLING_UI && (
+        <div style={{ marginTop: 6 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={showHelloCycling}
+              onChange={(e) => onShowHelloCyclingChange(e.target.checked)}
+            />
+            <span>ハローサイクリング ステーションを表示</span>
+          </label>
+        </div>
+      )}
+        </>
+      )}
+      <SlopeCalculationModal
+        isOpen={showSlopeCalculationModal}
+        onClose={() => setShowSlopeCalculationModal(false)}
+      />
+    </div>
+  );
+}
+
+// 自由配置した仮設停留所のシミュレーション結果・個別操作パネル（画面右上に表示）。
+function CustomStopSimulationPanel({
+  isVisible,
+  isAddingCustomStop,
+  isEvaluating,
+  summary,
+  analysisThresholdMultiplier,
+  onToggleAddingCustomStop,
+  onClearStops,
+  onRemoveStop,
+  onFlyToStop,
+  onExportGeoJson,
+  onClose,
+}: {
+  isVisible: boolean;
+  isAddingCustomStop: boolean;
+  isEvaluating: boolean;
+  summary: CustomStopSimulationSummary | null;
+  analysisThresholdMultiplier: number;
+  onToggleAddingCustomStop: () => void;
+  onClearStops: () => void;
+  onRemoveStop: (id: number) => void;
+  onFlyToStop: (id: number) => void;
+  onExportGeoJson?: () => void;
+  onClose: () => void;
+}) {
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  if (!isVisible) return null;
+  const stopCount = summary?.stopCount ?? 0;
+  const newlyCovered = summary?.newlyCoveredBuildings ?? 0;
+  const newlyCoveredArea = summary?.newlyCoveredFloorArea ?? 0;
+  const severeReduction =
+    summary != null ? summary.severeGapBeforeBuildings - summary.severeGapAfterBuildings : 0;
+  const busThreshold = Math.round(BUS_COVERAGE_THRESHOLD_METERS * analysisThresholdMultiplier);
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        right: 12,
+        top: 12,
+        zIndex: 14,
+        width: "min(360px, calc(100vw - 24px))",
+        maxHeight: "calc(100vh - 110px)",
+        overflowY: "auto",
+        boxSizing: "border-box",
+        background: "rgba(15, 23, 42, 0.92)",
+        color: "#fff",
+        padding: "10px 14px",
+        borderRadius: 8,
+        fontSize: 12.5,
+        lineHeight: 1.5,
+        fontFamily: "sans-serif",
+        boxShadow: "0 8px 24px rgba(0, 0, 0, 0.55)",
+        border: isAddingCustomStop
+          ? "1.5px solid #38bdf8"
+          : "1px solid rgba(56, 189, 248, 0.4)",
+        pointerEvents: "auto",
+      }}
+      onWheel={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+        <div
+          onClick={() => setIsCollapsed((prev) => !prev)}
+          style={{ cursor: "pointer", flex: 1, userSelect: "none" }}
+        >
+          <div style={{ color: "#38bdf8", fontWeight: "bold", fontSize: 14 }}>
+            停留所の自由配置シミュレーション
+          </div>
+          <div style={{ fontSize: 11, color: "#cbd5e1", marginTop: 1 }}>
+            バス停基準: 実効距離{busThreshold}m圏（基準{analysisThresholdMultiplier.toFixed(1)}倍・傾斜補正込み）
+          </div>
+          {isCollapsed && (
+            <div style={{ fontSize: 11.5, color: "#e2e8f0", marginTop: 4 }}>
+              配置中: <b>{stopCount}箇所</b> ／ 新規カバー:{" "}
+              <b style={{ color: "#38bdf8" }}>+{newlyCovered.toLocaleString()}棟</b>
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
+          <button
+            type="button"
+            aria-label={isCollapsed ? "パネルを展開" : "パネルを折りたたむ"}
+            title={isCollapsed ? "展開する" : "折りたたむ"}
+            onClick={() => setIsCollapsed((prev) => !prev)}
+            style={{
+              border: "1px solid rgba(148, 163, 184, 0.4)",
+              borderRadius: 4,
+              background: "rgba(255, 255, 255, 0.08)",
+              color: "#cbd5e1",
+              fontSize: 11,
+              lineHeight: 1,
+              cursor: "pointer",
+              padding: "4px 6px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {isCollapsed ? "▼ 展開" : "▲ 縮小"}
+          </button>
+          <button
+            type="button"
+            aria-label="シミュレーションを終了して閉じる"
+            title="シミュレーションを終了して閉じる"
+            onClick={onClose}
+            style={{
+              border: "1px solid rgba(148, 163, 184, 0.4)",
+              borderRadius: 4,
+              background: "rgba(255, 255, 255, 0.08)",
+              color: "#cbd5e1",
+              fontSize: 11,
+              lineHeight: 1,
+              cursor: "pointer",
+              padding: "4px 6px",
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+
+      {!isCollapsed && (
+        <>
+          <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+            <button
+              type="button"
+              onClick={onToggleAddingCustomStop}
+              style={{
+                flex: 1,
+                padding: "7px 10px",
+                borderRadius: 5,
+                border: isAddingCustomStop ? "1px solid #bae6fd" : "1px solid rgba(56, 189, 248, 0.7)",
+                background: isAddingCustomStop ? "#0284c7" : "rgba(2, 132, 199, 0.35)",
+                color: "#fff",
+                fontWeight: "bold",
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              {isAddingCustomStop ? "ピン配置モード中（配置を完了する）" : "地図クリックで停留所を追加"}
+            </button>
+          </div>
+
+          {isAddingCustomStop && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: "6px 8px",
+                borderRadius: 4,
+                background: "rgba(56, 189, 248, 0.16)",
+                border: "1px dashed rgba(125, 211, 252, 0.6)",
+                color: "#e0f2fe",
+                fontSize: 11.5,
+              }}
+            >
+              地図上の設置したい場所（道路沿いや赤い空白地の中）をクリックすると、停留所ピン（#1, #2…）が追加され、新たにカバーされる建物が<b style={{ color: "#38bdf8" }}>水色</b>に変わります。配置が終わったら上のボタンで完了してください。
+            </div>
+          )}
+
+          {isEvaluating && (
+            <div style={{ marginTop: 8, color: "#7dd3fc", fontSize: 11.5 }}>
+              周辺の地形傾斜とカバー建物を計算中…
+            </div>
+          )}
+
+          {stopCount === 0 ? (
+            <div style={{ marginTop: 10, color: "#94a3b8", fontSize: 12 }}>
+              まだ仮設停留所が配置されていません。地図上をクリックすると、何棟の建物がカバー圏内に入るか即座に試算できます。
+            </div>
+          ) : (
+            <>
+              <div
+                style={{
+                  marginTop: 10,
+                  padding: "10px 12px",
+                  borderRadius: 6,
+                  background: "rgba(2, 132, 199, 0.18)",
+                  border: "1px solid rgba(56, 189, 248, 0.5)",
+                }}
+              >
+                <div style={{ fontSize: 11.5, color: "#bae6fd" }}>
+                  追加した停留所（{stopCount}箇所）の合算効果
+                </div>
+                <div style={{ marginTop: 2, fontSize: 22, fontWeight: "bold", color: "#38bdf8" }}>
+                  +{newlyCovered.toLocaleString()}棟{" "}
+                  <span style={{ fontSize: 13, fontWeight: "normal", color: "#e2e8f0" }}>
+                    が新規カバー（水色）
+                  </span>
+                </div>
+                {newlyCoveredArea > 0 && (
+                  <div style={{ fontSize: 11.5, color: "#cbd5e1" }}>
+                    新規カバー建物の延床面積合計: 約{Math.round(newlyCoveredArea).toLocaleString()}m²
+                  </div>
+                )}
+                {summary && (
+                  <div style={{ marginTop: 6, fontSize: 12, borderTop: "1px solid rgba(255,255,255,0.15)", paddingTop: 6 }}>
+                    <div>
+                      交通空白地（全体）: {summary.totalGapBuildingsBefore.toLocaleString()}棟 →{" "}
+                      <b>{summary.remainingGapBuildings.toLocaleString()}棟</b>
+                    </div>
+                    <div>
+                      非常に遠い空白地（濃い赤）: {summary.severeGapBeforeBuildings.toLocaleString()}棟 →{" "}
+                      <b>{summary.severeGapAfterBuildings.toLocaleString()}棟</b>
+                      {severeReduction > 0 && (
+                        <span style={{ color: "#86efac", fontWeight: "bold" }}>
+                          （-{severeReduction.toLocaleString()}棟）
+                        </span>
+                      )}
+                    </div>
+                    {summary.averageImprovedBusBeforeMeters != null &&
+                      summary.averageImprovedBusAfterMeters != null && (
+                        <div style={{ marginTop: 2 }}>
+                          周辺改善建物（{summary.improvedGapBuildingsCount}棟）の平均バス実効距離: 約
+                          {Math.round(summary.averageImprovedBusBeforeMeters)}m →{" "}
+                          <b style={{ color: "#7dd3fc" }}>
+                            約{Math.round(summary.averageImprovedBusAfterMeters)}m
+                          </b>
+                        </div>
+                      )}
+                  </div>
+                )}
+                {onExportGeoJson && (
+                  <button
+                    type="button"
+                    onClick={onExportGeoJson}
+                    title="配置した仮設停留所と新規カバー建物をGeoJSON形式でダウンロードします（QGIS等で開けます）"
+                    style={{
+                      marginTop: 8,
+                      width: "100%",
+                      padding: "6px 10px",
+                      fontSize: 11.5,
+                      fontWeight: "bold",
+                      borderRadius: 4,
+                      border: "1px solid rgba(56, 189, 248, 0.6)",
+                      background: "rgba(2, 132, 199, 0.35)",
+                      color: "#e0f2fe",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: 6,
+                    }}
+                  >
+                    <span>シミュレーション結果を出力 (GeoJSON)</span>
+                  </button>
+                )}
+              </div>
+
+              <div style={{ marginTop: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                  <span style={{ fontWeight: "bold", fontSize: 12, color: "#e2e8f0" }}>
+                    配置した停留所一覧（{stopCount}箇所）
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onClearStops}
+                    style={{
+                      padding: "3px 8px",
+                      fontSize: 11,
+                      borderRadius: 4,
+                      border: "1px solid rgba(248,113,113,0.5)",
+                      background: "rgba(127,29,29,0.4)",
+                      color: "#fecaca",
+                      cursor: "pointer",
+                    }}
+                  >
+                    すべてクリア
+                  </button>
+                </div>
+                <div style={{ display: "grid", gap: 5 }}>
+                  {summary?.perStopStats.map((stat) => (
+                    <div
+                      key={stat.id}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 6,
+                        padding: "5px 8px",
+                        borderRadius: 5,
+                        background: "rgba(255,255,255,0.06)",
+                        border: "1px solid rgba(255,255,255,0.12)",
+                        fontSize: 11.5,
+                      }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <span style={{ fontWeight: "bold", color: "#38bdf8" }}>{stat.label}</span>
+                        <span style={{ marginLeft: 6, color: "#e2e8f0" }}>
+                          単独カバー: <b>{stat.standaloneCoveredBuildings}棟</b>
+                        </span>
+                        {stopCount > 1 && (
+                          <span style={{ marginLeft: 4, color: "#94a3b8", fontSize: 10.5 }}>
+                            （最寄り貢献 {stat.primaryCoveredBuildings}棟）
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                        <button
+                          type="button"
+                          onClick={() => onFlyToStop(stat.id)}
+                          style={{
+                            padding: "2px 6px",
+                            fontSize: 10.5,
+                            borderRadius: 3,
+                            border: "1px solid rgba(125,211,252,0.45)",
+                            background: "rgba(2,132,199,0.28)",
+                            color: "#e0f2fe",
+                            cursor: "pointer",
+                          }}
+                        >
+                          移動
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onRemoveStop(stat.id)}
+                          aria-label={`${stat.label}を削除`}
+                          style={{
+                            padding: "2px 6px",
+                            fontSize: 10.5,
+                            borderRadius: 3,
+                            border: "1px solid rgba(255,255,255,0.25)",
+                            background: "rgba(255,255,255,0.08)",
+                            color: "#cbd5e1",
+                            cursor: "pointer",
+                          }}
+                        >
+                          削除
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// モビリティ・ハブ実証検討シミュレーション用パネル（画面右上に表示）。
+function MobilityHubSimulationPanel({
+  isVisible,
+  selectedMode,
+  minMeters,
+  maxMeters,
+  activeHubIds,
+  hubModes,
+  summary,
+  onSelectMode,
+  onChangeMinMeters,
+  onChangeMaxMeters,
+  onToggleHub,
+  onUpdateHubMode,
+  onFlyToHub,
+  onExportGeoJson,
+  onClose,
+}: {
+  isVisible: boolean;
+  selectedMode: MobilityHubMode;
+  minMeters: number;
+  maxMeters: number;
+  activeHubIds: number[];
+  hubModes: Record<number, MobilityHubMode>;
+  summary: MobilityHubSimulationSummary | null;
+  onSelectMode: (mode: MobilityHubMode) => void;
+  onChangeMinMeters: (val: number) => void;
+  onChangeMaxMeters: (val: number) => void;
+  onToggleHub: (hubId: number) => void;
+  onUpdateHubMode: (hubId: number, mode: MobilityHubMode) => void;
+  onFlyToHub: (hubId: number) => void;
+  onExportGeoJson?: () => void;
+  onClose: () => void;
+}) {
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  if (!isVisible) return null;
+
+  const rescuedCount = summary?.newlyCoveredBuildings ?? 0;
+  const rescuedArea = summary?.newlyCoveredFloorArea ?? 0;
+  const severeReduction = summary != null ? summary.severeGapCoveredBuildings : 0;
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        right: 12,
+        top: 12,
+        zIndex: 14,
+        width: "min(390px, calc(100vw - 24px))",
+        maxHeight: "calc(100vh - 110px)",
+        overflowY: "auto",
+        boxSizing: "border-box",
+        background: "rgba(15, 23, 42, 0.94)",
+        color: "#fff",
+        padding: "12px 14px",
+        borderRadius: 8,
+        fontSize: 12.5,
+        lineHeight: 1.5,
+        fontFamily: "sans-serif",
+        boxShadow: "0 8px 24px rgba(0, 0, 0, 0.55)",
+        border: "1.5px solid #f59e0b",
+        pointerEvents: "auto",
+      }}
+      onWheel={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+        <div
+          onClick={() => setIsCollapsed((prev) => !prev)}
+          style={{ cursor: "pointer", flex: 1, userSelect: "none" }}
+        >
+          <div style={{ color: "#fbbf24", fontWeight: "bold", fontSize: 13.5, whiteSpace: "nowrap" }}>
+            モビリティ・ハブ検討シミュレーション
+          </div>
+          <div style={{ fontSize: 11, color: "#fcd34d", marginTop: 1, fontWeight: "500" }}>
+            ※藤沢市実証検討段階の候補地4箇所（未確定）
+          </div>
+          {isCollapsed && (
+            <div style={{ fontSize: 11.5, color: "#e2e8f0", marginTop: 4 }}>
+              有効ハブ: <b>{activeHubIds.length}箇所</b> ／ 救済:{" "}
+              <b style={{ color: "#fbbf24" }}>+{rescuedCount.toLocaleString()}棟</b>
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
+          <button
+            type="button"
+            aria-label={isCollapsed ? "パネルを展開" : "パネルを折りたたむ"}
+            title={isCollapsed ? "展開する" : "折りたたむ"}
+            onClick={() => setIsCollapsed((prev) => !prev)}
+            style={{
+              border: "1px solid rgba(148, 163, 184, 0.4)",
+              borderRadius: 4,
+              background: "rgba(255, 255, 255, 0.08)",
+              color: "#cbd5e1",
+              fontSize: 11,
+              lineHeight: 1,
+              cursor: "pointer",
+              padding: "4px 6px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {isCollapsed ? "▼ 展開" : "▲ 縮小"}
+          </button>
+          <button
+            type="button"
+            aria-label="ハブ検討モードを終了して閉じる"
+            title="ハブ検討モードを終了して閉じる"
+            onClick={onClose}
+            style={{
+              border: "1px solid rgba(148, 163, 184, 0.4)",
+              borderRadius: 4,
+              background: "rgba(255, 255, 255, 0.08)",
+              color: "#cbd5e1",
+              fontSize: 11,
+              lineHeight: 1,
+              cursor: "pointer",
+              padding: "4px 6px",
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+
+      {!isCollapsed && (
+        <>
+          {/* モード選択プリセット */}
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 11, color: "#cbd5e1", marginBottom: 4, fontWeight: "bold" }}>
+              交通モード・一括選択（全ハブに適用）:
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
+              {MOBILITY_HUB_MODES.map((modeDef) => {
+                const isSelected = selectedMode === modeDef.id;
+                return (
+                  <button
+                    key={modeDef.id}
+                    type="button"
+                    onClick={() => onSelectMode(modeDef.id)}
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: 5,
+                      border: isSelected ? "1.5px solid #fbbf24" : "1px solid rgba(255, 255, 255, 0.15)",
+                      background: isSelected
+                        ? "linear-gradient(180deg, rgba(245, 158, 11, 0.35) 0%, rgba(217, 119, 6, 0.35) 100%)"
+                        : "rgba(255, 255, 255, 0.06)",
+                      color: isSelected ? "#fef3c7" : "#e2e8f0",
+                      fontWeight: isSelected ? "bold" : "normal",
+                      fontSize: 11.5,
+                      cursor: "pointer",
+                      textAlign: "left",
+                      lineHeight: 1.3,
+                    }}
+                  >
+                    <div>{modeDef.label}</div>
+                    <div style={{ fontSize: 10, color: isSelected ? "#fcd34d" : "#94a3b8" }}>
+                      {modeDef.id === "custom"
+                        ? "任意の距離帯"
+                        : `${modeDef.minMeters}m〜${
+                            modeDef.maxMeters >= 1000
+                              ? `${modeDef.maxMeters / 1000}km`
+                              : `${modeDef.maxMeters}m`
+                          }`}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 距離範囲スライダー */}
+          <div
+            style={{
+              marginTop: 10,
+              padding: "8px 10px",
+              borderRadius: 6,
+              background: "rgba(255, 255, 255, 0.05)",
+              border: "1px solid rgba(255, 255, 255, 0.1)",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11 }}>
+              <span>
+                ハブからの最小距離: <b>{minMeters}m</b>
+              </span>
+              <span style={{ fontSize: 10, color: "#94a3b8" }}>（徒歩圏の下限）</span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={2000}
+              step={50}
+              value={minMeters}
+              onChange={(e) => onChangeMinMeters(Number(e.target.value))}
+              style={{ width: "100%", marginTop: 2 }}
+            />
+
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                fontSize: 11,
+                marginTop: 6,
+              }}
+            >
+              <span>
+                ハブからの最大到達距離:{" "}
+                <b>
+                  {maxMeters >= 1000
+                    ? `${(maxMeters / 1000).toFixed(1)}km (${maxMeters}m)`
+                    : `${maxMeters}m`}
+                </b>
+              </span>
+              <span style={{ fontSize: 10, color: "#94a3b8" }}>（モビリティ有効圏）</span>
+            </div>
+            <input
+              type="range"
+              min={200}
+              max={4000}
+              step={50}
+              value={maxMeters}
+              onChange={(e) => onChangeMaxMeters(Number(e.target.value))}
+              style={{ width: "100%", marginTop: 2 }}
+            />
+            <div style={{ fontSize: 10.5, color: "#94a3b8", marginTop: 3 }}>
+              ※上のスライダーは「自由設定」や全体の基本距離帯を調整します。下の候補地リストからハブごとに別々の交通モード（例: H1はサイクル、H4はカーシェア）を個別に指定することも可能です。
+            </div>
+          </div>
+
+          {/* シミュレーション結果カード */}
+          <div
+            style={{
+              marginTop: 10,
+              padding: "10px 12px",
+              borderRadius: 6,
+              background: "rgba(245, 158, 11, 0.18)",
+              border: "1px solid rgba(245, 158, 11, 0.5)",
+            }}
+          >
+            <div style={{ fontSize: 11.5, color: "#fef3c7" }}>
+              有効ハブ（{activeHubIds.length}箇所）による救済効果
+            </div>
+            <div style={{ marginTop: 2, fontSize: 22, fontWeight: "bold", color: "#fbbf24" }}>
+              +{rescuedCount.toLocaleString()}棟{" "}
+              <span style={{ fontSize: 13, fontWeight: "normal", color: "#e2e8f0" }}>
+                が空白地から救済（オレンジ）
+              </span>
+            </div>
+            {rescuedArea > 0 && (
+              <div style={{ fontSize: 11.5, color: "#cbd5e1" }}>
+                救済建物の延床面積合計: 約{Math.round(rescuedArea).toLocaleString()}m²
+              </div>
+            )}
+            {summary && (
+              <div
+                style={{
+                  marginTop: 6,
+                  fontSize: 12,
+                  borderTop: "1px solid rgba(255,255,255,0.15)",
+                  paddingTop: 6,
+                }}
+              >
+                <div>
+                  交通空白地（全体）: {summary.totalGapBuildingsBefore.toLocaleString()}棟 →{" "}
+                  <b>{(summary.totalGapBuildingsBefore - rescuedCount).toLocaleString()}棟</b>
+                </div>
+                <div>
+                  深刻な空白地（非常に遠い/濃い赤）: {summary.severeGapBeforeBuildings.toLocaleString()}棟 →{" "}
+                  <b>{(summary.severeGapBeforeBuildings - severeReduction).toLocaleString()}棟</b>
+                  {severeReduction > 0 && (
+                    <span style={{ color: "#86efac", fontWeight: "bold" }}>
+                      （-{severeReduction.toLocaleString()}棟）
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+            {onExportGeoJson && (
+              <button
+                type="button"
+                onClick={onExportGeoJson}
+                title="候補地と救済建物をGeoJSON形式でダウンロードします（QGIS等で開けます）"
+                style={{
+                  marginTop: 8,
+                  width: "100%",
+                  padding: "6px 10px",
+                  fontSize: 11.5,
+                  fontWeight: "bold",
+                  borderRadius: 4,
+                  border: "1px solid rgba(245, 158, 11, 0.7)",
+                  background: "rgba(217, 119, 6, 0.35)",
+                  color: "#fef3c7",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                }}
+              >
+                <span>ハブ検討結果を出力 (GeoJSON)</span>
+              </button>
+            )}
+          </div>
+
+          {/* 候補地一覧 */}
+          <div style={{ marginTop: 10 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: 6,
+              }}
+            >
+              <span style={{ fontWeight: "bold", fontSize: 12, color: "#e2e8f0" }}>
+                検討候補地一覧（全4箇所）
+              </span>
+              <span style={{ fontSize: 11, color: "#94a3b8" }}>モード個別変更可</span>
+            </div>
+            <div style={{ display: "grid", gap: 6 }}>
+              {MOBILITY_HUB_CANDIDATES.map((hub) => {
+                const isActive = activeHubIds.includes(hub.id);
+                const currentHubMode = hubModes[hub.id] ?? selectedMode;
+                const hDef = MOBILITY_HUB_MODES.find((m) => m.id === currentHubMode);
+                const hubMin = currentHubMode === "custom" ? minMeters : (hDef?.minMeters ?? minMeters);
+                const hubMax = currentHubMode === "custom" ? maxMeters : (hDef?.maxMeters ?? maxMeters);
+                const stat = summary?.perHubStats.find((s: { hubId: number }) => s.hubId === hub.id);
+                return (
+                  <div
+                    key={hub.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 6,
+                      padding: "6px 8px",
+                      borderRadius: 5,
+                      background: isActive
+                        ? "rgba(255, 255, 255, 0.08)"
+                        : "rgba(255, 255, 255, 0.02)",
+                      border: isActive
+                        ? "1px solid rgba(245, 158, 11, 0.4)"
+                        : "1px solid rgba(255, 255, 255, 0.08)",
+                      opacity: isActive ? 1 : 0.6,
+                      fontSize: 11.5,
+                    }}
+                  >
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        minWidth: 0,
+                        cursor: "pointer",
+                        flex: 1,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isActive}
+                        onChange={() => onToggleHub(hub.id)}
+                      />
+                      <div style={{ minWidth: 0 }}>
+                        <div>
+                          <b style={{ color: "#fbbf24" }}>H{hub.id}</b>{" "}
+                          <span style={{ color: "#fff", fontWeight: "bold" }}>{hub.name}</span>
+                        </div>
+                        <div style={{ fontSize: 10.5, color: "#cbd5e1" }}>
+                          {hub.address}
+                          {isActive && stat && (
+                            <div style={{ marginTop: 2 }}>
+                              <span style={{ color: "#fcd34d", fontWeight: "bold" }}>
+                                救済: {stat.coveredBuildings.toLocaleString()}棟
+                              </span>
+                              <span style={{ fontSize: 10, color: "#94a3b8", marginLeft: 5 }}>
+                                （{hubMin}m〜{hubMax >= 1000 ? `${hubMax / 1000}km` : `${hubMax}m`}）
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </label>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, flexShrink: 0 }}>
+                      <button
+                        type="button"
+                        onClick={() => onFlyToHub(hub.id)}
+                        style={{
+                          padding: "2px 7px",
+                          fontSize: 10.5,
+                          borderRadius: 3,
+                          border: "1px solid rgba(245, 158, 11, 0.5)",
+                          background: "rgba(217, 119, 6, 0.3)",
+                          color: "#fef3c7",
+                          cursor: "pointer",
+                        }}
+                      >
+                        移動
+                      </button>
+                      {isActive && (
+                        <select
+                          value={currentHubMode}
+                          onChange={(e) => onUpdateHubMode(hub.id, e.target.value as MobilityHubMode)}
+                          style={{
+                            padding: "3px 5px",
+                            fontSize: 11,
+                            fontWeight: "500",
+                            borderRadius: 4,
+                            border: "1px solid rgba(245, 158, 11, 0.6)",
+                            background: "rgba(15, 23, 42, 0.95)",
+                            color: "#fbbf24",
+                            cursor: "pointer",
+                          }}
+                        >
+                          <option value="cycle">サイクル (400-1.5km)</option>
+                          <option value="kickboard">特定小型 (400-1km)</option>
+                          <option value="carshare">カーシェア (1-3km)</option>
+                          <option value="custom">自由設定</option>
+                        </select>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// 「なぜ白いままの建物が多いのか」の説明。左上のLegendは既に縦に長いため、
+// 空いている右下に別枠で表示する（右上はInfoPopupが使う）。
+function UncoloredBuildingsNote() {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        right: 12,
+        bottom: 12,
+        zIndex: 10,
+        background: "rgba(20, 20, 20, 0.75)",
+        color: "#fff",
+        padding: "8px 10px",
+        borderRadius: 6,
+        fontSize: 11,
+        lineHeight: 1.5,
+        fontFamily: "sans-serif",
+        maxWidth: 260,
+        pointerEvents: "none",
+      }}
+    >
+      白い建物は住宅系以外・用途不明・未評価です。読み込み中、通信失敗、道路網データ未収録の場合も白く表示されます。
+    </div>
+  );
+}
+
+
+
+// 道路網距離データ読み込みやプロファイル切り替え時に、画面中央のごく一部にコンパクトに表示するローディングバッジ。
+// 全面オーバーレイと異なり、画面全体のマップや建物の色の変化を遮らずに見ることができる。
+function CenterLoadingIndicator({
+  loadingState,
+}: {
+  loadingState: { title: string; subtitle?: string } | null;
+}) {
+  if (!loadingState) return null;
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: "50%",
+        left: "50%",
+        transform: "translate(-50%, -50%)",
+        zIndex: 1000,
+        display: "flex",
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 14,
+        padding: "12px 20px",
+        background: "rgba(15, 23, 42, 0.88)",
+        backdropFilter: "blur(8px)",
+        border: "1px solid rgba(56, 189, 248, 0.35)",
+        borderRadius: 12,
+        boxShadow: "0 8px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05)",
+        color: "#fff",
+        pointerEvents: "none",
+        fontFamily: "sans-serif",
+      }}
+    >
+      <style>{"@keyframes center-loading-spin { to { transform: rotate(360deg); } }"}</style>
+      <div
+        style={{
+          width: 30,
+          height: 30,
+          flexShrink: 0,
+          border: "3.5px solid rgba(56, 189, 248, 0.25)",
+          borderTopColor: "#38bdf8",
+          borderRadius: "50%",
+          animation: "center-loading-spin 0.85s linear infinite",
+        }}
+      />
+      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+        <div style={{ color: "#f8fafc", fontSize: 14, fontWeight: "bold", letterSpacing: "0.02em" }}>
+          {loadingState.title}
+        </div>
+        {loadingState.subtitle && (
+          <div style={{ fontSize: 11, color: "#94a3b8" }}>
+            {loadingState.subtitle}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+
+
+
+// 追加数を増やしたときの改善の伸びを、数値と小さな棒グラフで同時に見せる。
+// 「最適数」は費用・用地・運行体制で変わるため断定せず、現在スライダーで選んだ案を
+// 地図上の紫ピンと対応させて比較する。
+function DemandTransitRecommendationPanel({
+  analysis,
+  selectedCount,
+  isRunning,
+  pendingThresholdMultiplier,
+  isVisible,
+  onClose,
+}: {
+  analysis: DemandTransitPlanAnalysis | null;
+  selectedCount: number;
+  isRunning: boolean;
+  pendingThresholdMultiplier: number;
+  isVisible: boolean;
+  onClose: () => void;
+}) {
+  if (!isVisible) return null;
+  if (!analysis && !isRunning) return null;
+  if (!analysis) {
+    const busThreshold = Math.round(BUS_COVERAGE_THRESHOLD_METERS * pendingThresholdMultiplier);
+    const stationThreshold = Math.round(STATION_COVERAGE_THRESHOLD_METERS * pendingThresholdMultiplier);
+    return (
+      <div
+        style={{
+          position: "absolute", right: 12, bottom: 82, zIndex: 10,
+          width: "min(620px, calc(100vw - 24px))", minHeight: 300,
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+          boxSizing: "border-box", background: "rgba(20, 20, 20, 0.92)", color: "#fff",
+          padding: 30, borderRadius: 6, fontFamily: "sans-serif", pointerEvents: "auto",
+        }}
+        onWheel={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <button
+          type="button"
+          aria-label="アクセス改善比較を閉じる"
+          onClick={onClose}
+          style={{
+            position: "absolute", top: 12, right: 14, border: 0, background: "transparent", color: "#fff",
+            fontSize: 28, lineHeight: 1, cursor: "pointer", pointerEvents: "auto",
+          }}
+        >
+          ×
+        </button>
+        <style>{"@keyframes demand-transit-analysis-spin { to { transform: rotate(360deg); } }"}</style>
+        <div style={{ width: 64, height: 64, border: "7px solid rgba(216,180,254,0.25)", borderTopColor: "#d8b4fe", borderRadius: "50%", animation: "demand-transit-analysis-spin 0.9s linear infinite" }} />
+        <div style={{ marginTop: 22, color: "#d8b4fe", fontSize: 22, fontWeight: "bold" }}>アクセス改善案を比較中…</div>
+        <div style={{ marginTop: 8, fontSize: 15, color: "#e5e7eb" }}>実効距離・基準{pendingThresholdMultiplier.toFixed(1)}倍（バス{busThreshold}m／駅{stationThreshold}m相当）</div>
+      </div>
+    );
+  }
+  const selected = analysis.results.find((result) => result.count === selectedCount) ?? analysis.results.at(-1);
+  if (!selected) return null;
+  const maxReduction = Math.max(
+    ...analysis.results.map((result) => result.averageBeforeMeters - result.averageAfterMeters),
+    1
+  );
+  const maxFarthestReduction = Math.max(
+    ...analysis.results.map(
+      (result) => result.farthestTenPercentBeforeMeters - result.farthestTenPercentAfterMeters
+    ),
+    1
+  );
+  const reduction = selected.averageBeforeMeters - selected.averageAfterMeters;
+  const comparisonBusThreshold = Math.round(BUS_COVERAGE_THRESHOLD_METERS * analysis.thresholdMultiplier);
+  const comparisonStationThreshold = Math.round(STATION_COVERAGE_THRESHOLD_METERS * analysis.thresholdMultiplier);
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        right: 12,
+        bottom: 82,
+        zIndex: 10,
+        // 成果を説明する主パネルなので、従来の幅310pxから約2.5倍に広げる。小さい
+        // 画面では画面内に収め、縦方向も必要に応じてパネル内でスクロールさせる。
+        width: "min(620px, calc(100vw - 24px))",
+        minHeight: "min(700px, calc(100vh - 94px))",
+        maxHeight: "calc(100vh - 94px)",
+        overflowY: "auto",
+        boxSizing: "border-box",
+        background: "rgba(20, 20, 20, 0.88)",
+        color: "#fff",
+        padding: "24px 30px",
+        borderRadius: 6,
+        fontSize: 16,
+        lineHeight: 1.5,
+        fontFamily: "sans-serif",
+        pointerEvents: "auto",
+      }}
+      onWheel={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <button
+        type="button"
+        aria-label="アクセス改善比較を閉じる"
+        onClick={onClose}
+        style={{
+          position: "absolute", top: 12, right: 14, zIndex: 2, border: 0, background: "transparent", color: "#fff",
+          fontSize: 28, lineHeight: 1, cursor: "pointer", pointerEvents: "auto",
+        }}
+      >
+        ×
+      </button>
+      <div style={{ color: "#d8b4fe", fontSize: 17, fontWeight: "bold" }}>追加乗り場数ごとのアクセス改善比較</div>
+      <div
+        style={{
+          marginTop: 12,
+          padding: "12px 14px",
+          border: "1px solid rgba(216,180,254,0.75)",
+          borderRadius: 6,
+          background: "rgba(126,34,206,0.18)",
+        }}
+      >
+        <div style={{ color: "#d8b4fe", fontSize: 14, fontWeight: "bold" }}>現在選択中の案</div>
+        <div style={{ marginTop: 2, fontSize: 24, fontWeight: "bold" }}>{selected.count}か所を追加した場合</div>
+        <div style={{ marginTop: 4, color: "#ddd", fontSize: 13 }}>
+          比較条件：実効距離・基準{analysis.thresholdMultiplier.toFixed(1)}倍（バス{comparisonBusThreshold}m／駅{comparisonStationThreshold}m相当）
+        </div>
+        <div style={{ marginTop: 3 }}>
+          対象建物の平均実効距離: 約{Math.round(selected.averageBeforeMeters)}m → 約
+          {Math.round(selected.averageAfterMeters)}m
+          <span style={{ color: "#86efac", fontWeight: "bold" }}>（約{Math.round(reduction)}m短縮）</span>
+        </div>
+        <div>新たに比較基準内のバス圏に入る住宅: {selected.newlyCoveredBuildings.toLocaleString()}棟</div>
+        <div style={{ marginTop: 5 }}>
+          遠い上位10%の平均実効距離: 約{Math.round(selected.farthestTenPercentBeforeMeters)}m → 約
+          {Math.round(selected.farthestTenPercentAfterMeters)}m
+          <span style={{ color: "#fcd34d", fontWeight: "bold" }}>
+            （約{Math.round(selected.farthestTenPercentBeforeMeters - selected.farthestTenPercentAfterMeters)}m短縮）
+          </span>
+        </div>
+        <div>
+          比較基準を1.5倍超過する住宅: {selected.severeGapBeforeBuildings.toLocaleString()}棟 → {selected.severeGapAfterBuildings.toLocaleString()}棟
+        </div>
+      </div>
+      <div style={{ marginTop: 16, borderTop: "2px solid rgba(255,255,255,0.4)", paddingTop: 12 }}>
+        <div style={{ color: "#fff", fontSize: 20, fontWeight: "bold" }}>全案の比較（1〜10か所）</div>
+        <div style={{ marginTop: 2, marginBottom: 10, fontSize: 13, opacity: 0.8 }}>
+          現在選択中の案だけでなく、追加数ごとの短縮幅を並べています。棒が長いほど改善が大きいことを示します。
+        </div>
+        {analysis.results.map((result) => {
+          const resultReduction = result.averageBeforeMeters - result.averageAfterMeters;
+          const farthestReduction = result.farthestTenPercentBeforeMeters - result.farthestTenPercentAfterMeters;
+          const isSelected = result.count === selectedCount;
+          return (
+            <div
+              key={result.count}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 9,
+                minHeight: 48,
+                marginBottom: 5,
+                boxSizing: "border-box",
+                padding: "3px 7px",
+                border: isSelected ? "2px solid #d8b4fe" : "2px solid transparent",
+                borderRadius: 7,
+                background: isSelected ? "rgba(192,132,252,0.16)" : "transparent",
+                boxShadow: isSelected ? "0 0 0 1px rgba(216,180,254,0.2)" : "none",
+              }}
+            >
+              <span
+                style={{
+                  width: 66,
+                  flexShrink: 0,
+                  whiteSpace: "nowrap",
+                  color: isSelected ? "#d8b4fe" : "#ddd",
+                  fontWeight: isSelected ? "bold" : "normal",
+                }}
+              >
+                {result.count}か所
+              </span>
+              <div style={{ display: "grid", gap: 3 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13 }}>
+                  <span style={{ width: 50 }}>平均</span>
+                  <span style={{ width: 240, height: 12, background: "rgba(255,255,255,0.15)", borderRadius: 6, overflow: "hidden" }}>
+                    <span
+                      style={{
+                        display: "block",
+                        width: `${Math.max(2, (resultReduction / maxReduction) * 100)}%`,
+                        height: "100%",
+                        background: "#60a5fa",
+                      }}
+                    />
+                  </span>
+                  <span>−{Math.round(resultReduction)}m</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, color: "#fcd34d" }}>
+                  <span style={{ width: 50 }}>遠い10%</span>
+                  <span style={{ width: 240, height: 12, background: "rgba(255,255,255,0.15)", borderRadius: 6, overflow: "hidden" }}>
+                    <span
+                      style={{
+                        display: "block",
+                        width: `${Math.max(2, (farthestReduction / maxFarthestReduction) * 100)}%`,
+                        height: "100%",
+                        background: "#f59e0b",
+                      }}
+                    />
+                  </span>
+                  <span>−{Math.round(farthestReduction)}m</span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ marginTop: 12, color: "#cbd5e1", fontSize: 13 }}>
+        各行は、前の案で選んだ地点を残したまま、概算上の短縮量が最も大きい地点を一つずつ追加した案です。
+      </div>
+      <div style={{ marginTop: 12, fontSize: 13, opacity: 0.7 }}>
+        {analysis.scopeLabel}の比較対象 {analysis.targetBuildingCount.toLocaleString()}棟を比較。遠い10%は追加前に最も遠かった建物群を固定して比較しています。{analysis.methodLabel} 用地・運行費用は含みません。
+      </div>
+      {isRunning && (
+        <div
+          style={{
+            position: "absolute", inset: 0, zIndex: 1, display: "flex", flexDirection: "column",
+            alignItems: "center", justifyContent: "center", borderRadius: 6,
+            background: "rgba(11, 16, 19, 0.86)", color: "#fff",
+          }}
+        >
+          <style>{"@keyframes demand-transit-analysis-spin { to { transform: rotate(360deg); } }"}</style>
+          <div style={{ width: 68, height: 68, border: "8px solid rgba(216,180,254,0.28)", borderTopColor: "#d8b4fe", borderRadius: "50%", animation: "demand-transit-analysis-spin 0.9s linear infinite" }} />
+          <div style={{ marginTop: 22, color: "#d8b4fe", fontSize: 22, fontWeight: "bold" }}>条件を反映して比較中…</div>
+          <div style={{ marginTop: 8, fontSize: 15, color: "#e5e7eb" }}>実効距離・基準{pendingThresholdMultiplier.toFixed(1)}倍で再計算しています</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function PlateauViewer() {
+  const popupRequestRef = useRef(0);
+  const candidatePopupRef = useRef(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [roadSnapNotice, setRoadSnapNotice] = useState<{
+    message: string;
+    isError: boolean;
+    isPending?: boolean;
+  } | null>(null);
+  const roadSnapNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showRoadSnapNoticeRef = useRef<
+    (
+      message: string,
+      isError?: boolean,
+      options?: { autoDismissMs?: number | null; isPending?: boolean }
+    ) => void
+  >(() => {});
+
+  const showRoadSnapNotice = useCallback(
+    (
+      message: string,
+      isError = false,
+      options?: { autoDismissMs?: number | null; isPending?: boolean }
+    ) => {
+      if (roadSnapNoticeTimerRef.current) {
+        clearTimeout(roadSnapNoticeTimerRef.current);
+        roadSnapNoticeTimerRef.current = null;
+      }
+      setRoadSnapNotice({ message, isError, isPending: options?.isPending });
+      const timeoutMs =
+        options?.autoDismissMs === undefined ? (isError ? 2600 : 1800) : options.autoDismissMs;
+      if (timeoutMs !== null) {
+        roadSnapNoticeTimerRef.current = setTimeout(() => {
+          roadSnapNoticeTimerRef.current = null;
+          setRoadSnapNotice(null);
+        }, timeoutMs);
+      }
+    },
+    []
+  );
+  showRoadSnapNoticeRef.current = showRoadSnapNotice;
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const viewerRef = useRef<Cesium.Viewer | null>(null);
+  const [popup, setPopup] = useState<PopupInfo | null>(null);
+  const [demandTransitClusterCount, setDemandTransitClusterCount] = useState(
+    DEMAND_TRANSIT_CLUSTER_COUNT_DEFAULT
+  );
+  const [demandTransitAnalysisThresholdMultiplier, setDemandTransitAnalysisThresholdMultiplier] = useState(
+    DEMAND_TRANSIT_ANALYSIS_THRESHOLD_MULTIPLIER_DEFAULT
+  );
+  // ハローサイクリングのステーションピンの表示/非表示トグル（デフォルトOFF）。初期表示は
+  // 本題（交通空白地の色分け・デマンド交通候補地）に絞って見やすくするための既定値で、
+  // 必要な場合はユーザーがLegendのチェックボックスから自分でオンにできる。既存のスライダーと
+  // 同じ「Legend内のUIでReact stateを変更し、init()内で作られたCesiumエンティティに反映する」
+  // 方式を踏襲するが、こちらは再クラスタリングのような重い再計算が不要なため、
+  // helloCyclingEntitiesRefに保持した各エンティティのentity.showを直接切り替えるだけで済む。
+  const [showHelloCycling, setShowHelloCycling] = useState(false);
+  // 勾配感度・歩行速度のプロファイル（「一般」/「高齢者」）。切り替えるとbuildingScoreCacheが
+  // 全建物ぶん無効化され、読み込み済みの建物すべてを新しいプロファイルで再計算する（詳細は
+  // applyWalkProfileのコメント参照）。
+  const [walkProfile, setWalkProfile] = useState<WalkProfile>(WALK_PROFILE_DEFAULT);
+  // 【実験的】直線距離モデル/道路網距離モデルの切り替え（詳細はDistanceModelのコメント参照）。
+  const [distanceModel, setDistanceModel] = useState<DistanceModel>(DISTANCE_MODEL_DEFAULT);
+  // "network"に初めて切り替えたときに大容量JSONを遅延読み込みする。読み込み中はtrueにして
+  // Legendのラジオボタンを一時的に操作不能にし、多重フェッチを防ぐ。
+  const [loadingNetworkScores, setLoadingNetworkScores] = useState(false);
+  // 画面中央のごく一部に表示するコンパクトなローディング状態（道路網距離や高齢者プロファイル切り替え時用）
+  const [centerLoading, setCenterLoading] = useState<{ title: string; subtitle?: string } | null>(
+    null
+  );
+  // 【実験的】道路網距離モデルの閾値倍率（詳細はNETWORK_THRESHOLD_MULTIPLIER_DEFAULTのコメント参照）。
+  // 直線距離モデルの閾値(400m/800m)は常に固定で、このstateは"network"選択時のみ効く。
+  const [networkThresholdMultiplier, setNetworkThresholdMultiplier] = useState(
+    NETWORK_THRESHOLD_MULTIPLIER_DEFAULT
+  );
+  // 【実験的】距離モデルのUIブロック（ラジオボタン・説明文・緩和倍率スライダー）の折りたたみ
+  // 開閉状態。初見の審査員が「別の判定基準がある」と誤解しないよう、既定で閉じておく
+  // （詳細な経緯はセクション見出しの説明文参照）。
+  const [showExperimentalDistanceModel, setShowExperimentalDistanceModel] = useState(false);
+  // 「追加数と改善効果を比較」ボタンの結果。計算時点で読み込み済みの建物を対象にするため、
+  // カメラ移動で後から建物が増えても、表示済みの比較結果はその時点のスナップショットとして残す。
+  const [demandTransitPlanAnalysis, setDemandTransitPlanAnalysis] = useState<DemandTransitPlanAnalysis | null>(null);
+  const [isDemandTransitAnalysisRunning, setIsDemandTransitAnalysisRunning] = useState(false);
+  // 初見では地図の把握を優先し、比較結果は左上のボタンから任意で開く。
+  const [isDemandTransitPanelVisible, setIsDemandTransitPanelVisible] = useState(false);
+  // 任意地点の停留所自由配置シミュレーション用のstate。
+  const [isAddingCustomStop, setIsAddingCustomStop] = useState(false);
+  const [isLegendCollapsed, setIsLegendCollapsed] = useState(false);
+  const [isEvaluatingCustomStops, setIsEvaluatingCustomStops] = useState(false);
+  const [customStopSummary, setCustomStopSummary] = useState<CustomStopSimulationSummary | null>(null);
+
+  // モビリティ・ハブ実証検討シミュレーション用のstate。
+  const [isMobilityHubActive, setIsMobilityHubActive] = useState(false);
+  const [mobilityHubMode, setMobilityHubMode] = useState<MobilityHubMode>("cycle");
+  const [mobilityHubMinMeters, setMobilityHubMinMeters] = useState(400);
+  const [mobilityHubMaxMeters, setMobilityHubMaxMeters] = useState(1500);
+  const [activeMobilityHubIds, setActiveMobilityHubIds] = useState<number[]>([1, 2, 3, 4]);
+  const [hubModes, setHubModes] = useState<Record<number, MobilityHubMode>>({
+    1: "cycle",
+    2: "cycle",
+    3: "cycle",
+    4: "cycle",
+  });
+  const [mobilityHubSummary, setMobilityHubSummary] = useState<MobilityHubSimulationSummary | null>(null);
+
+  // Cesiumのイベントハンドラ（init()内のクロージャ）はマウント時に1度だけ作られ、Reactの
+  // 再レンダリングでは作り直されないため、スライダーの最新値をそのクロージャから読めるように
+  // refで橋渡しする（値が変わるたびにrefだけ更新し、Viewer自体は再構築しない）。
+  const demandTransitClusterCountRef = useRef(demandTransitClusterCount);
+  const demandTransitAnalysisThresholdMultiplierRef = useRef(demandTransitAnalysisThresholdMultiplier);
+  const walkProfileRef = useRef(walkProfile);
+  const distanceModelRef = useRef(distanceModel);
+  const networkThresholdMultiplierRef = useRef(networkThresholdMultiplier);
+  const isAddingCustomStopRef = useRef(isAddingCustomStop);
+  const isMobilityHubActiveRef = useRef(isMobilityHubActive);
+  const mobilityHubModeRef = useRef(mobilityHubMode);
+  const mobilityHubMinMetersRef = useRef(mobilityHubMinMeters);
+  const mobilityHubMaxMetersRef = useRef(mobilityHubMaxMeters);
+  const activeMobilityHubIdsRef = useRef(activeMobilityHubIds);
+  const hubModesRef = useRef(hubModes);
+  const mobilityHubSummaryRef = useRef<MobilityHubSimulationSummary | null>(null);
+
+  // ハローサイクリングのピンをinit()内で非同期生成する際、生成時点のトグル状態を
+  // 直接参照するためのref（他のトグルと同じ理由。init()のuseEffectは依存配列が空なので、
+  // stateを直接参照するとexhaustive-depsの警告が出るうえ値も更新されない）。
+  const showHelloCyclingRef = useRef(showHelloCycling);
+  useEffect(() => {
+    demandTransitClusterCountRef.current = demandTransitClusterCount;
+    demandTransitAnalysisThresholdMultiplierRef.current = demandTransitAnalysisThresholdMultiplier;
+    walkProfileRef.current = walkProfile;
+    distanceModelRef.current = distanceModel;
+    networkThresholdMultiplierRef.current = networkThresholdMultiplier;
+    showHelloCyclingRef.current = showHelloCycling;
+    isAddingCustomStopRef.current = isAddingCustomStop;
+    isMobilityHubActiveRef.current = isMobilityHubActive;
+    mobilityHubModeRef.current = mobilityHubMode;
+    mobilityHubMinMetersRef.current = mobilityHubMinMeters;
+    mobilityHubMaxMetersRef.current = mobilityHubMaxMeters;
+    activeMobilityHubIdsRef.current = activeMobilityHubIds;
+    hubModesRef.current = hubModes;
+    mobilityHubSummaryRef.current = mobilityHubSummary;
+  }, [
+    demandTransitClusterCount,
+    demandTransitAnalysisThresholdMultiplier,
+    walkProfile,
+    distanceModel,
+    networkThresholdMultiplier,
+    showHelloCycling,
+    isAddingCustomStop,
+    isMobilityHubActive,
+    mobilityHubMode,
+    mobilityHubMinMeters,
+    mobilityHubMaxMeters,
+    activeMobilityHubIds,
+    hubModes,
+    mobilityHubSummary,
+  ]);
+  // init()内で定義されるscheduleDemandTransitRecomputeをスライダーのonChangeから呼べるように
+  // するための橋渡し。Viewerがまだ初期化中の場合はnullのままで、呼び出し側でガードする。
+  const scheduleDemandTransitRecomputeRef = useRef<(() => void) | null>(null);
+  const scheduleDemandTransitAnalysisRef = useRef<((delayMs?: number) => void) | null>(null);
+  // プロファイル切り替えのonChangeから呼べるようにするための橋渡し。walkProfileRef.currentを
+  // 同期的に更新してからbuildingScoreCacheを無効化・再計算するため、上のuseEffect経由の
+  // 非同期な同期だと間に合わない（イベントハンドラ内でsetWalkProfileした直後にこの関数を
+  // 呼ぶと、re-render前なのでuseEffectがまだ走っていない）。そのためinit()側の関数自身が
+  // walkProfileRef.currentを直接書き換える。
+  const applyWalkProfileRef = useRef<((profile: WalkProfile) => void) | null>(null);
+  // 【実験的】距離モデル切り替えのonChangeから呼べるようにするための橋渡し（applyWalkProfileRefと同じ理由）。
+  const applyDistanceModelRef = useRef<((model: DistanceModel) => void) | null>(null);
+  // 【実験的】道路網距離モデルの閾値倍率スライダーのonChangeから呼べるようにするための橋渡し
+  // （applyWalkProfileRefと同じ理由。同期的にrefを書き換えてからキャッシュを無効化する）。
+  const applyNetworkThresholdMultiplierRef = useRef<((multiplier: number) => void) | null>(null);
+  // 自由配置した仮設停留所の操作用ref。
+  const removeCustomStopRef = useRef<((id: number) => void) | null>(null);
+  const undoLastCustomStopRef = useRef<(() => void) | null>(null);
+  const clearCustomStopsRef = useRef<(() => void) | null>(null);
+  const flyToCustomStopRef = useRef<((id: number) => void) | null>(null);
+  const reapplyCustomStopScoresRef = useRef<(() => void) | null>(null);
+  const exportCustomStopSimulationGeoJsonRef = useRef<(() => void) | null>(null);
+  const warmUpRoutingGraphRef = useRef<(() => void) | null>(null);
+  const clearRouteComparisonRef = useRef<(() => void) | null>(null);
+  const snapRoadWarmupPromiseRef = useRef<Promise<void> | null>(null);
+  const customStopSummaryRef = useRef<CustomStopSimulationSummary | null>(null);
+
+  // モビリティ・ハブ操作用ref。
+  const reapplyMobilityHubScoresRef = useRef<(() => void) | null>(null);
+  const flyToMobilityHubRef = useRef<((hubId: number) => void) | null>(null);
+  const exportMobilityHubGeoJsonRef = useRef<(() => void) | null>(null);
+  const flyToInitialViewRef = useRef<((durationSec?: number) => void) | null>(null);
+
+  useEffect(() => {
+    customStopSummaryRef.current = customStopSummary;
+  }, [customStopSummary]);
+
+  const isSimulationPanelVisible =
+    isAddingCustomStop || (customStopSummary?.stopCount ?? 0) > 0 || isMobilityHubActive;
+
+  useEffect(() => {
+    if (!isSimulationPanelVisible) return;
+    ++popupRequestRef.current;
+    candidatePopupRef.current = false;
+    setPopup(null);
+    clearRouteComparisonRef.current?.();
+  }, [isSimulationPanelVisible]);
+
+  const handleSelectMobilityHubMode = (mode: MobilityHubMode) => {
+    setMobilityHubMode(mode);
+    mobilityHubModeRef.current = mode;
+    const def = MOBILITY_HUB_MODES.find((m) => m.id === mode);
+    if (def) {
+      setMobilityHubMinMeters(def.minMeters);
+      mobilityHubMinMetersRef.current = def.minMeters;
+      setMobilityHubMaxMeters(def.maxMeters);
+      mobilityHubMaxMetersRef.current = def.maxMeters;
+    }
+    const nextHubModes: Record<number, MobilityHubMode> = { 1: mode, 2: mode, 3: mode, 4: mode };
+    setHubModes(nextHubModes);
+    hubModesRef.current = nextHubModes;
+    reapplyMobilityHubScoresRef.current?.();
+  };
+
+  const handleUpdateHubMode = (hubId: number, mode: MobilityHubMode) => {
+    const next = { ...hubModesRef.current, [hubId]: mode };
+    hubModesRef.current = next;
+    setHubModes(next);
+    reapplyMobilityHubScoresRef.current?.();
+  };
+
+  const handleChangeMobilityHubMinMeters = (val: number) => {
+    setMobilityHubMinMeters(val);
+    mobilityHubMinMetersRef.current = val;
+    setMobilityHubMode("custom");
+    mobilityHubModeRef.current = "custom";
+    reapplyMobilityHubScoresRef.current?.();
+  };
+
+  const handleChangeMobilityHubMaxMeters = (val: number) => {
+    setMobilityHubMaxMeters(val);
+    mobilityHubMaxMetersRef.current = val;
+    setMobilityHubMode("custom");
+    mobilityHubModeRef.current = "custom";
+    reapplyMobilityHubScoresRef.current?.();
+  };
+
+  const handleToggleMobilityHub = (hubId: number) => {
+    const prev = activeMobilityHubIdsRef.current;
+    const next = prev.includes(hubId) ? prev.filter((id) => id !== hubId) : [...prev, hubId];
+    activeMobilityHubIdsRef.current = next;
+    setActiveMobilityHubIds(next);
+    reapplyMobilityHubScoresRef.current?.();
+  };
+
+  const handleToggleMobilityHubActive = () => {
+    const next = !isMobilityHubActiveRef.current;
+    isMobilityHubActiveRef.current = next;
+    setIsMobilityHubActive(next);
+    if (next) {
+      setIsLegendCollapsed(true);
+      if (isAddingCustomStopRef.current) {
+        setIsAddingCustomStop(false);
+        isAddingCustomStopRef.current = false;
+      }
+      // 別エリアへ移動した状態からでも4つの実証候補地が確実に画面内に入るよう、
+      // モビリティ・ハブ検討を開始したタイミングで地図の表示位置を初期視点へリセットする。
+      flyToInitialViewRef.current?.(1.0);
+    } else {
+      setIsLegendCollapsed(false);
+    }
+    reapplyMobilityHubScoresRef.current?.();
+  };
+
+  const handleCloseMobilityHub = () => {
+    setIsMobilityHubActive(false);
+    isMobilityHubActiveRef.current = false;
+    setIsLegendCollapsed(false);
+    reapplyMobilityHubScoresRef.current?.();
+  };
+
+  const warmUpCustomStopResources = () => {
+    // 1つ目の停留所配置で数秒待たされるのを防ぐため、追加モードを開いた時点で
+    // サーバー側の道路インデックス構築（/api/snap-road）を先行実行しておく。
+    if (!snapRoadWarmupPromiseRef.current) {
+      const p = fetch(
+        `/api/snap-road?lat=${INITIAL_VIEW_CENTER_LAT}&lng=${INITIAL_VIEW_CENTER_LNG}&maxDistance=1`
+      )
+        .then(() => undefined)
+        .catch(() => undefined)
+        .finally(() => {
+          if (snapRoadWarmupPromiseRef.current === p) {
+            snapRoadWarmupPromiseRef.current = null;
+          }
+        });
+      snapRoadWarmupPromiseRef.current = p;
+    }
+    if (distanceModelRef.current === "network") {
+      warmUpRoutingGraphRef.current?.();
+    }
+  };
+
+  const handleToggleAddingCustomStop = () => {
+    const next = !isAddingCustomStopRef.current;
+    isAddingCustomStopRef.current = next;
+    setIsAddingCustomStop(next);
+    if (next) {
+      setIsLegendCollapsed(true);
+      if (isMobilityHubActiveRef.current) {
+        handleCloseMobilityHub();
+      }
+      warmUpCustomStopResources();
+    } else if ((customStopSummaryRef.current?.stopCount ?? 0) === 0) {
+      setIsLegendCollapsed(false);
+    }
+  };
+  // ハローサイクリングのピンとして作成した全エンティティを保持し、トグル操作のたびに
+  // entity.showを一括で切り替えられるようにする（データの再取得・再作成はしない）。
+  const helloCyclingEntitiesRef = useRef<Cesium.Entity[]>([]);
+  useEffect(() => {
+    for (const entity of helloCyclingEntitiesRef.current) {
+      entity.show = showHelloCycling;
+    }
+  }, [showHelloCycling]);
+
+  useEffect(() => {
+    if (!containerRef.current || viewerRef.current) return;
+
+    let cancelled = false;
+    let disposeRuntime = () => {};
+
+    async function init() {
+      let terrainProvider: Cesium.TerrainProvider;
+      try {
+        terrainProvider = await Cesium.CesiumTerrainProvider.fromUrl(TERRAIN_URL);
+      } catch (err) {
+        console.error("PLATEAU-Terrainの読み込みに失敗しました。平坦な地形で継続します。", err);
+        terrainProvider = new Cesium.EllipsoidTerrainProvider();
+      }
+      if (cancelled || !containerRef.current) return;
+
+      const viewer = new Cesium.Viewer(containerRef.current, {
+        terrainProvider,
+        // Cesium ionのデフォルト背景画像を使わず、元のPLATEAU-Ortho（航空写真）をベースに使う
+        baseLayer: Cesium.ImageryLayer.fromProviderAsync(
+          Promise.resolve(
+            new Cesium.UrlTemplateImageryProvider({
+              url: ORTHO_URL,
+              credit: "Project PLATEAU (国土交通省)",
+              maximumLevel: 19,
+            })
+          ),
+          {}
+        ),
+        // 開発中に不要なUIを削って画面を広く使う。必要に応じて有効化する。
+        baseLayerPicker: false,
+        geocoder: false,
+        homeButton: false,
+        sceneModePicker: false,
+        navigationHelpButton: false,
+        fullscreenButton: false,
+        animation: false,
+        timeline: false,
+        // 独自のバス停ポップアップUIと、Cesium標準のinfoBox/selectionIndicatorが
+        // 競合しないよう最初から無効化している（plateau-pocで発生した問題の再発防止）。
+        infoBox: false,
+        selectionIndicator: false,
+      });
+      viewerRef.current = viewer;
+
+      // 航空写真の上にOpenStreetMapの道路網を半透明（40%）でオーバーレイ。
+      // これにより、元の落ち着いた美しいダークトーンと3D建物の水色発光を維持したまま、
+      // 道路の筋・交差点・道路名が透けて見えるようになる。
+      try {
+        const osmRoadsLayer = viewer.imageryLayers.addImageryProvider(
+          new Cesium.UrlTemplateImageryProvider({
+            url: OSM_URL,
+            credit: "OpenStreetMap contributors",
+            maximumLevel: 19,
+          })
+        );
+        osmRoadsLayer.alpha = 0.42;
+      } catch (err) {
+        console.warn("道路網オーバーレイの読み込みに失敗しました", err);
+      }
+
+      let tileset: Cesium.Cesium3DTileset | undefined;
+      try {
+        tileset = await Cesium.Cesium3DTileset.fromUrl(BUILDING_TILESET_URL);
+        if (cancelled) return;
+        // デフォルトのcolorBlendMode(HIGHLIGHT)はfeature.colorを建物の元のマテリアル色と
+        // 乗算するため、元の色が純白でない場合に色分けが意図した色より薄暗く・分かりにくく
+        // なることがある。REPLACEにして、スコアに応じた色をそのまま表示させる。
+        tileset.colorBlendMode = Cesium.Cesium3DTileColorBlendMode.REPLACE;
+        viewer.scene.primitives.add(tileset);
+      } catch (err) {
+        console.error("PLATEAU 建物3D Tilesの読み込みに失敗しました", err);
+      }
+
+      // PLATEAU-Orthoは藤沢市北部エリアで一部タイルが404になり抜けがある
+      // （江の島周辺を扱うplateau-pocでは発生しなかった。おそらくオルソ画像の
+      // モザイク範囲がエリアによって粗密差がある）。Cesiumのデフォルト地表色（青、
+      // 一見「海」に見えて紛らわしい）ではなく中立なグレーにして、抜けを「データなし」と
+      // 分かるようにしておく。
+      viewer.scene.globe.baseColor = Cesium.Color.DARKSLATEGRAY;
+
+      // バス停をピンで表示する。ラベルは付けず、クリックで名称をポップアップ表示する
+      // （337件と数が多く、常時ラベル表示すると密集地でズームアウト時に重なりすぎるため）。
+      // busStopList は自動フィット用に全件保持し、majorOperatorStopList は実効距離の
+      // 計算（最寄りバス停検索）専用に主要事業者のみへ絞り込んだもの。
+      const busStopPositions: Cesium.Cartesian3[] = [];
+      let busStopList: BusStop[] = [];
+      let majorOperatorStopList: BusStop[] = [];
+      try {
+        const res = await fetch(BUS_STOPS_JSON_URL);
+        const data: { busStops: BusStop[] } = await res.json();
+        if (cancelled) return;
+        busStopList = data.busStops;
+        majorOperatorStopList = busStopList.filter(isMajorOperatorStop);
+        for (const stop of busStopList) {
+          const position = Cesium.Cartesian3.fromDegrees(stop.lng, stop.lat);
+          busStopPositions.push(position);
+          const isMajor = isMajorOperatorStop(stop);
+          viewer.entities.add({
+            name: stop.name,
+            position,
+            properties: { isBusStop: true, operator: stop.operator, routes: stop.routes, isMajorOperator: isMajor },
+            point: {
+              pixelSize: isMajor ? BUS_STOP_PIXEL_SIZE : BUS_STOP_PIXEL_SIZE_MINOR,
+              color: isMajor ? BUS_STOP_COLOR : BUS_STOP_COLOR_MINOR,
+              outlineColor: Cesium.Color.WHITE,
+              outlineWidth: 1,
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            },
+          });
+        }
+      } catch (err) {
+        console.error("バス停データの読み込みに失敗しました", err);
+      }
+
+      // 建物の北部判定（JR東海道本線より北側か）に使う簡易ポリラインを読み込む。
+      let tokaidoLinePoints: [number, number][] = [];
+      try {
+        const res = await fetch(TOKAIDO_LINE_JSON_URL);
+        const data: { points: [number, number][] } = await res.json();
+        if (cancelled) return;
+        tokaidoLinePoints = data.points;
+      } catch (err) {
+        console.warn(
+          "東海道線データの読み込みに失敗しました。建物のアクセシビリティ色分けはスキップされます。",
+          err
+        );
+      }
+
+      // 市の距離閾値を参考にした推計に使う周辺交通施設データを読み込む。
+      let trainStationList: TrainStation[] = [];
+      try {
+        const res = await fetch("/data/analysis-facilities.json");
+        if (!res.ok) throw new Error("交通施設データの取得に失敗しました");
+        const data: { stations: TrainStation[]; busStops: BusStop[] } = await res.json();
+        majorOperatorStopList = data.busStops.filter(isMajorOperatorStop);
+        if (cancelled) return;
+        trainStationList = data.stations;
+      } catch (err) {
+        console.warn(
+          "鉄道駅データの読み込みに失敗しました。建物のアクセシビリティ色分けはスキップされます。",
+          err
+        );
+      }
+
+      // 駅・地区名をテキストラベルとして常時表示する。土地勘のない判定員・自治体職員でも
+      // 位置関係を把握できるようにするための、あくまで補助的な表示（クリック不要、装飾のみ）。
+      // isDemandTransitCandidate等のpropertiesを付けていないため、クリックハンドラの分岐には
+      // 一切引っかからず、素通りしてsetPopup(null)になるだけ（既存の建物・バス停クリックと競合しない）。
+      try {
+        const res = await fetch(PLACE_LABELS_JSON_URL);
+        const data: { places: PlaceLabel[] } = await res.json();
+        if (cancelled) return;
+        for (const place of data.places) {
+          viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(place.lng, place.lat),
+            label: {
+              text: place.name,
+              font: "bold 16px sans-serif",
+              fillColor: Cesium.Color.WHITE,
+              outlineColor: Cesium.Color.BLACK,
+              outlineWidth: 2,
+              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+              // アイコンピン（32x32px）と座標が一致してもアイコンを隠さないよう、
+              // 文字をアンカー位置より下（足元側）にオフセットして表示する。
+              verticalOrigin: Cesium.VerticalOrigin.TOP,
+              pixelOffset: new Cesium.Cartesian2(0, 18),
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            },
+          });
+        }
+      } catch (err) {
+        console.warn("地名ラベルデータの読み込みに失敗しました。ラベル表示なしで継続します。", err);
+      }
+
+      // 藤沢市が既に運行している乗合タクシー・オンデマンドバスの拠点を、青い円ピンでオーバーレイ
+      // 表示する。デマンド交通候補（紫の四角、このPoCの提案）と見た目で明確に区別することで、
+      // 「市の既存の取り組みを無視して候補を出しているのではない」ことを示す（詳細は上記
+      // EXISTING_DEMAND_TRANSIT_JSON_URLのコメント参照）。
+      // 【対応済みの不具合】当初は概算の運行エリアを半透明の円（ellipse、GroundPrimitiveとして
+      // 地形に貼り付く）でも表示していたが、viewer.scene.pick()はクリック位置で最前面の
+      // オブジェクトを1つだけ返す仕様のため、この円の範囲内（半径数百m）にある建物をクリックしても
+      // 3D Tilesの建物フィーチャーではなく必ずこの円のエンティティが拾われてしまい、円の下にある
+      // 建物の情報を一切表示できなくなっていた。円は情報量としては副次的（ピンの位置だけで
+      // 拠点は伝わる）なので、円を削除しピンのみの表示に変更して解消した。
+      try {
+        const res = await fetch(EXISTING_DEMAND_TRANSIT_JSON_URL);
+        const data: { services: ExistingDemandTransitService[] } = await res.json();
+        if (cancelled) return;
+        const existingDemandTransitIconUrl = createCircleIconDataUrl(
+          EXISTING_DEMAND_TRANSIT_COLOR.toCssColorString()
+        );
+        for (const service of data.services) {
+          // サービス単位ではなく、実際の停留所（stops）単位でピンを1つずつ配置する
+          // （詳細は上記コメント参照。天神町10件・のりあい善行17件、いずれも実在の停留所）。
+          for (const stop of service.stops) {
+            viewer.entities.add({
+              name: `${service.name}（${stop.name}）`,
+              position: Cesium.Cartesian3.fromDegrees(stop.lng, stop.lat),
+              properties: { isExistingDemandTransit: true, service, stopName: stop.name },
+              billboard: {
+                image: existingDemandTransitIconUrl,
+                // 【対応済みの経緯】バス停ピン（pixelSize=BUS_STOP_PIXEL_SIZE=10）に合わせて
+                // 一度10x10に縮小したが、「見つけづらくなった」というフィードバックを受けて
+                // 元の20x20に戻した。他の丸ピンより一回り大きいのは、この地図上では
+                // 意図的な差別化（既存デマンド交通は目立たせたい）として許容する。
+                width: 20,
+                height: 20,
+                verticalOrigin: Cesium.VerticalOrigin.CENTER,
+                heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+                disableDepthTestDistance: Number.POSITIVE_INFINITY,
+              },
+            });
+          }
+        }
+      } catch (err) {
+        console.warn("既存デマンド交通データの読み込みに失敗しました。オーバーレイ表示なしで継続します。", err);
+      }
+
+      // ハローサイクリングのステーションを黄色い自転車ピンで表示する（表示のみ、色分けロジックには
+      // 未組み込み）。/api/hellocycling-stations はサーバー側でODPT_CONSUMER_KEYが未設定の場合や
+      // ODPT側のエラー時に500/502を返すが、いずれもこのアプリの他の機能には影響しないため、
+      // 失敗時はconsole.warnのみでピン無しのまま継続する。
+      try {
+        const res = await fetch(HELLO_CYCLING_STATIONS_API_URL);
+        if (!res.ok) throw new Error(`hellocycling-stations API returned ${res.status}`);
+        const data: { stations: HelloCyclingStation[] } = await res.json();
+        if (cancelled) return;
+        const bicycleIconUrl = createBicycleIconDataUrl(HELLO_CYCLING_COLOR);
+        for (const station of data.stations) {
+          const entity = viewer.entities.add({
+            name: station.name,
+            position: Cesium.Cartesian3.fromDegrees(station.lng, station.lat),
+            properties: { isHelloCyclingStation: true, capacity: station.capacity },
+            // 初期表示（既定OFF）とここでの生成が非同期に完了するタイミングがズレるため、
+            // Cesiumのentity.showの既定値（true）に任せず、現在のトグル状態を明示的に渡す。
+            // 切り替えのたびの反映は下のuseEffect（helloCyclingEntitiesRef経由）が担う。
+            show: showHelloCyclingRef.current,
+            billboard: {
+              image: bicycleIconUrl,
+              width: 22,
+              height: 22,
+              verticalOrigin: Cesium.VerticalOrigin.CENTER,
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            },
+          });
+          helloCyclingEntitiesRef.current.push(entity);
+        }
+      } catch (err) {
+        console.warn("ハローサイクリングのステーションデータの読み込みに失敗しました。ピン表示なしで継続します。", err);
+      }
+
+      // モビリティ・ハブ実証検討候補地（藤沢市提示の4箇所）のピン。
+      // モビリティ・ハブモードが有効な時、かつactiveMobilityHubIdsに含まれるハブのみ表示する。
+      type MobilityHubRuntime = {
+        hub: MobilityHubSite;
+        entity: Cesium.Entity;
+      };
+      const mobilityHubEntities: MobilityHubRuntime[] = [];
+      for (const hub of MOBILITY_HUB_CANDIDATES) {
+        const entity = viewer.entities.add({
+          name: `モビリティ・ハブ候補地 H${hub.id}（${hub.name}）`,
+          position: Cesium.Cartesian3.fromDegrees(hub.lng, hub.lat),
+          show: isMobilityHubActiveRef.current && activeMobilityHubIdsRef.current.includes(hub.id),
+          properties: {
+            isMobilityHub: true,
+            hubId: hub.id,
+            hubData: hub,
+          },
+          billboard: {
+            image: createMobilityHubPinIconDataUrl(hub.id),
+            width: 32,
+            height: 32,
+            verticalOrigin: Cesium.VerticalOrigin.CENTER,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            eyeOffset: new Cesium.Cartesian3(0, 0, -100),
+          },
+        });
+        mobilityHubEntities.push({ hub, entity });
+      }
+
+      function updateMobilityHubEntityVisibility() {
+        const isActive = isMobilityHubActiveRef.current;
+        const activeIds = activeMobilityHubIdsRef.current;
+        for (const { hub, entity } of mobilityHubEntities) {
+          entity.show = isActive && activeIds.includes(hub.id);
+        }
+      }
+
+      // 住宅系建物ごとに「最寄りバス停・最寄り駅までの傾斜込み実効距離」を計算し、市の距離基準を参考にした
+      // 距離閾値を参考にした独自推計（駅800m or バス400mのOR）で3D Tilesのフィーチャーを直接色分けする。
+      // buildingScoreCache は建物ID(_x,_yから作る代替IDを含む)をキーに永続化し、タイルが
+      // アンロード→再ロードされて新しいCesium3DTileFeatureインスタンスになった場合でも
+      // 地形サンプリングをやり直さずに再着色できるようにする。featureScoreMapは
+      // クリック時に「今画面にある生きたfeatureオブジェクト」からスコア情報を引くためのWeakMap。
+      type CachedScore = {
+        baseColor: Cesium.Color;
+        baseInfo: BuildingScoreInfo;
+        color: Cesium.Color;
+        info: BuildingScoreInfo;
+      };
+      const buildingScoreCache = new Map<string, CachedScore>();
+      let featureScoreMap = new WeakMap<Cesium.Cesium3DTileFeature, BuildingScoreInfo>();
+      const loadedTiles = new Set<Cesium.Cesium3DTile>();
+      // 【実験的】道路網距離モデル用の事前計算データ（scripts/road-network/03_compute_scores.py
+      // の出力）。"network"に初めて切り替えたときにapplyDistanceModelが遅延フェッチしてここへ
+      // 格納する。buildingIdをキーに直接引けるので、該当する建物は地形サンプリング不要で
+      // 即座に色を決められる。
+      let networkScoreMap: Map<string, BuildingNetworkScoreRow> | null = null;
+      let routingGraphCache: RoutingGraph | null = null;
+      let routingGraphPromise: Promise<RoutingGraph | null> | null = null;
+      let cachedRouteInspectRouter: { profile: WalkProfile; router: NetworkRouter } | null = null;
+      let routeComparisonEntities: Cesium.Entity[] = [];
+
+      function clearRouteComparisonEntities() {
+        if (routeComparisonEntities.length === 0) return;
+        for (const entity of routeComparisonEntities) {
+          viewer.entities.remove(entity);
+        }
+        routeComparisonEntities = [];
+        viewer.scene.requestRender();
+      }
+      clearRouteComparisonRef.current = clearRouteComparisonEntities;
+      // 成功した世代だけ処理済みとし、失敗はバックオフ後にtileVisibleから再試行する。
+      const tileWork = new TileWorkGate<Cesium.Cesium3DTile>();
+
+      // 自由配置した仮設停留所（複数配置可）のランタイム状態。
+      type CustomStopRuntime = CustomStopSite & {
+        entity: Cesium.Entity;
+        buildingDistances: Map<string, number>;
+        evaluatedBuildingIds: Set<string>;
+        routedNodeDistances?: Float64Array;
+      };
+      let customStops: CustomStopRuntime[] = [];
+      let nextCustomStopId = 1;
+      let customStopEvalGeneration = 0;
+      let customStopEvalTimer: ReturnType<typeof setTimeout> | null = null;
+      let isSnappingCustomStop = false;
+
+      async function ensureRoutingGraph(): Promise<RoutingGraph | null> {
+        if (routingGraphCache) return routingGraphCache;
+        if (routingGraphPromise) return routingGraphPromise;
+        routingGraphPromise = (async () => {
+          try {
+            const res = await fetch("/data/routing-graph.json");
+            if (!res.ok) throw new Error(`routing-graph: ${res.status}`);
+            const graph: RoutingGraph = await res.json();
+            if (cancelled) return null;
+            routingGraphCache = graph;
+            return graph;
+          } catch (err) {
+            console.warn("道路網グラフの取得に失敗しました", err);
+            return null;
+          } finally {
+            routingGraphPromise = null;
+          }
+        })();
+        return routingGraphPromise;
+      }
+      warmUpRoutingGraphRef.current = () => {
+        void ensureRoutingGraph();
+      };
+
+      function refreshLoadedTileFeatureColors() {
+        for (const tile of loadedTiles) {
+          const content = tile.content;
+          if (!content || content.featuresLength === 0) continue;
+          for (let i = 0; i < content.featuresLength; i++) {
+            const feature = content.getFeature(i);
+            const usage = feature.getProperty("bldg:usage") as string | undefined;
+            if (!usage || !usage.includes(RESIDENTIAL_USAGE_SUBSTRING)) continue;
+            const lng = feature.getProperty("_x") as number | undefined;
+            const lat = feature.getProperty("_y") as number | undefined;
+            if (typeof lng !== "number" || typeof lat !== "number") continue;
+            const buildingId =
+              (feature.getProperty("uro:BuildingIDAttribute_uro:buildingID") as string | undefined) ??
+              `${lng},${lat}`;
+            const cached = buildingScoreCache.get(buildingId);
+            if (cached) {
+              feature.color = cached.color;
+              featureScoreMap.set(feature, cached.info);
+            }
+          }
+        }
+        viewer.scene.requestRender();
+      }
+
+      function reapplyCustomStopScoresToBuildings() {
+        if (cancelled) return;
+        if (customStops.length === 0) {
+          for (const cached of buildingScoreCache.values()) {
+            cached.color = cached.baseColor;
+            cached.info = cached.baseInfo;
+          }
+          setCustomStopSummary(null);
+          customStopSummaryRef.current = null;
+          refreshLoadedTileFeatureColors();
+          return;
+        }
+
+        const records: CustomStopBuildingRecord[] = [];
+        for (const [buildingId, cached] of buildingScoreCache.entries()) {
+          records.push({
+            buildingId,
+            lat: cached.baseInfo.lat,
+            lng: cached.baseInfo.lng,
+            baseBusEffectiveDistanceMeters: cached.baseInfo.busEffectiveDistanceMeters,
+            baseStationEffectiveDistanceMeters: cached.baseInfo.stationEffectiveDistanceMeters,
+            baseCoverageRatio: cached.baseInfo.coverageRatio,
+            totalFloorArea: cached.baseInfo.totalFloorArea,
+          });
+        }
+
+        const stopDistanceMap = new Map<number, ReadonlyMap<string, number>>();
+        for (const stop of customStops) {
+          stopDistanceMap.set(stop.id, stop.buildingDistances);
+        }
+
+        const effectiveMultiplier =
+          distanceModelRef.current === "network"
+            ? networkThresholdMultiplierRef.current
+            : demandTransitAnalysisThresholdMultiplierRef.current;
+        const thresholdMultiplier = effectiveMultiplier;
+        const { outcomes, summary } = evaluateCustomStopsSimulation(
+          records,
+          customStops,
+          stopDistanceMap,
+          thresholdMultiplier
+        );
+        const walkSpeed = WALK_PROFILES[walkProfileRef.current].walkSpeedMPerMin;
+
+        for (const [buildingId, cached] of buildingScoreCache.entries()) {
+          const outcome = outcomes.get(buildingId);
+          if (outcome && outcome.bestStopId != null && outcome.bestStopLabel != null) {
+            cached.color = outcome.isNewlyCovered
+              ? NEWLY_COVERED_BUILDING_COLOR
+              : colorForCoverageRatio(outcome.afterCoverageRatio);
+            cached.info = {
+              ...cached.baseInfo,
+              customStopImprovement: {
+                stopId: outcome.bestStopId,
+                stopLabel: outcome.bestStopLabel,
+                afterBusEffectiveDistanceMeters: outcome.afterBusEffectiveDistanceMeters,
+                afterBusWalkMinutes: outcome.afterBusEffectiveDistanceMeters / walkSpeed,
+                afterCoverageRatio: outcome.afterCoverageRatio,
+                isNewlyCovered: outcome.isNewlyCovered,
+              },
+            };
+          } else {
+            cached.color = cached.baseColor;
+            cached.info = cached.baseInfo;
+          }
+        }
+
+        setCustomStopSummary(summary);
+        customStopSummaryRef.current = summary;
+        refreshLoadedTileFeatureColors();
+      }
+
+      let mobilityHubSimulationTimer: ReturnType<typeof setTimeout> | null = null;
+      function scheduleMobilityHubSimulation(delayMs = 60) {
+        if (!isMobilityHubActiveRef.current) return;
+        if (mobilityHubSimulationTimer) clearTimeout(mobilityHubSimulationTimer);
+        mobilityHubSimulationTimer = setTimeout(() => {
+          mobilityHubSimulationTimer = null;
+          reapplyMobilityHubScoresToBuildings();
+        }, delayMs);
+      }
+
+      function reapplyMobilityHubScoresToBuildings() {
+        if (cancelled) return;
+        updateMobilityHubEntityVisibility();
+        if (!isMobilityHubActiveRef.current) {
+          // ハブ検討が無効化された場合はベース色・情報に戻す
+          for (const cached of buildingScoreCache.values()) {
+            cached.color = cached.baseColor;
+            cached.info = cached.baseInfo;
+          }
+          setMobilityHubSummary(null);
+          mobilityHubSummaryRef.current = null;
+          refreshLoadedTileFeatureColors();
+          return;
+        }
+
+        const activeHubs = MOBILITY_HUB_CANDIDATES.filter((h) =>
+          activeMobilityHubIdsRef.current.includes(h.id)
+        );
+
+        const records: MobilityHubBuildingRecord[] = [];
+        for (const [buildingId, cached] of buildingScoreCache.entries()) {
+          records.push({
+            buildingId,
+            lat: cached.baseInfo.lat,
+            lng: cached.baseInfo.lng,
+            baseCoverageRatio: cached.baseInfo.coverageRatio,
+            totalFloorArea: cached.baseInfo.totalFloorArea,
+            baseBusEffectiveDistanceMeters: cached.baseInfo.busEffectiveDistanceMeters,
+            usage: cached.baseInfo.usage,
+          });
+        }
+
+        const minMeters = mobilityHubMinMetersRef.current;
+        const maxMeters = mobilityHubMaxMetersRef.current;
+        const modeKey = mobilityHubModeRef.current;
+        const modeDef = MOBILITY_HUB_MODES.find((m) => m.id === modeKey);
+        const modeLabel = modeDef?.label ?? "自由設定";
+
+        const hubConfigs = new Map<number, MobilityHubSiteConfig>();
+        for (const hub of activeHubs) {
+          const hMode = hubModesRef.current[hub.id] ?? modeKey;
+          const hDef = MOBILITY_HUB_MODES.find((m) => m.id === hMode);
+          const hMin = hMode === "custom" ? minMeters : (hDef?.minMeters ?? minMeters);
+          const hMax = hMode === "custom" ? maxMeters : (hDef?.maxMeters ?? maxMeters);
+          hubConfigs.set(hub.id, {
+            hubId: hub.id,
+            mode: hMode,
+            minDistanceMeters: hMin,
+            maxDistanceMeters: hMax,
+          });
+        }
+
+        const { outcomes, summary } = evaluateMobilityHubSimulation(
+          records,
+          activeHubs,
+          minMeters,
+          maxMeters,
+          modeKey,
+          hubConfigs
+        );
+
+        const hubRescuedColor = Cesium.Color.fromCssColorString(MOBILITY_HUB_PIN_COLOR_HEX);
+
+        for (const [buildingId, cached] of buildingScoreCache.entries()) {
+          const outcome = outcomes.get(buildingId);
+          if (outcome && outcome.isCoveredByHub && outcome.nearestHubId != null && outcome.nearestHubName != null) {
+            const nearestHub = activeHubs.find((h) => h.id === outcome.nearestHubId);
+            cached.color = hubRescuedColor;
+            cached.info = {
+              ...cached.baseInfo,
+              mobilityHubImprovement: {
+                hubId: outcome.nearestHubId,
+                hubName: outcome.nearestHubName,
+                hubAddress: nearestHub?.address ?? "",
+                hubDistanceMeters: outcome.hubDistanceMeters,
+                modeLabel: outcome.modeLabel ?? modeLabel,
+              },
+            };
+          } else {
+            cached.color = cached.baseColor;
+            cached.info = cached.baseInfo;
+          }
+        }
+
+        setMobilityHubSummary(summary);
+        mobilityHubSummaryRef.current = summary;
+        refreshLoadedTileFeatureColors();
+      }
+
+      async function evaluatePendingBuildingsForCustomStops() {
+        if (cancelled) return;
+        if (customStops.length === 0) {
+          setIsEvaluatingCustomStops(false);
+          reapplyCustomStopScoresToBuildings();
+          return;
+        }
+
+        const evalGen = ++customStopEvalGeneration;
+        const profile = WALK_PROFILES[walkProfileRef.current];
+
+        if (distanceModelRef.current === "network" && networkScoreMap) {
+          setIsEvaluatingCustomStops(true);
+          const graph = await ensureRoutingGraph();
+          if (cancelled || evalGen !== customStopEvalGeneration) return;
+          if (graph) {
+            const router = new NetworkRouter(graph, walkProfileRef.current);
+            for (const stop of customStops) {
+              if (!stop.routedNodeDistances) {
+                try {
+                  const routed = router.fromCandidate(stop.lat, stop.lng);
+                  stop.routedNodeDistances = routed.distances;
+                } catch (err) {
+                  console.warn("仮設停留所の道路網スナップに失敗しました", err);
+                }
+              }
+              if (stop.routedNodeDistances) {
+                for (const [buildingId, cached] of buildingScoreCache.entries()) {
+                  if (stop.evaluatedBuildingIds.has(buildingId)) continue;
+                  stop.evaluatedBuildingIds.add(buildingId);
+                  const row = networkScoreMap.get(buildingId);
+                  if (!row) continue;
+                  const dist = stop.routedNodeDistances[row.networkNode];
+                  if (Number.isFinite(dist) && dist < cached.baseInfo.busEffectiveDistanceMeters) {
+                    stop.buildingDistances.set(buildingId, dist);
+                  }
+                }
+              }
+            }
+          }
+          setIsEvaluatingCustomStops(false);
+          reapplyCustomStopScoresToBuildings();
+          return;
+        }
+
+        type PendingPairTask = {
+          stop: CustomStopRuntime;
+          buildingId: string;
+          baseInfo: BuildingScoreInfo;
+          pair: EffectiveDistancePair;
+        };
+        const tasks: PendingPairTask[] = [];
+
+        for (const stop of customStops) {
+          for (const [buildingId, cached] of buildingScoreCache.entries()) {
+            if (stop.evaluatedBuildingIds.has(buildingId)) continue;
+            stop.evaluatedBuildingIds.add(buildingId);
+            const straight = haversineMeters(
+              cached.baseInfo.lat,
+              cached.baseInfo.lng,
+              stop.lat,
+              stop.lng
+            );
+            // 傾斜補正後の実効距離は常に直線距離以上になるため、直線距離の時点で
+            // 既存の最寄りバス停の実効距離以上であれば短縮されることはなく、地形サンプリング不要。
+            if (straight >= cached.baseInfo.busEffectiveDistanceMeters) continue;
+            tasks.push({
+              stop,
+              buildingId,
+              baseInfo: cached.baseInfo,
+              pair: {
+                originLat: cached.baseInfo.lat,
+                originLng: cached.baseInfo.lng,
+                destLat: stop.lat,
+                destLng: stop.lng,
+              },
+            });
+          }
+        }
+
+        if (tasks.length === 0) {
+          setIsEvaluatingCustomStops(false);
+          reapplyCustomStopScoresToBuildings();
+          return;
+        }
+
+        setIsEvaluatingCustomStops(true);
+        try {
+          const results = await computeEffectiveDistances(
+            terrainProvider,
+            tasks.map((t) => t.pair),
+            profile.slopePenaltyFactor
+          );
+          if (cancelled || evalGen !== customStopEvalGeneration) return;
+          tasks.forEach((task, idx) => {
+            const eff = results[idx].effectiveDistanceMeters;
+            if (eff < task.baseInfo.busEffectiveDistanceMeters) {
+              task.stop.buildingDistances.set(task.buildingId, eff);
+            }
+          });
+        } catch (err) {
+          console.warn(
+            "仮設停留所の地形サンプリングに失敗したため、建物の既存勾配倍率で概算します。",
+            err
+          );
+          if (cancelled || evalGen !== customStopEvalGeneration) return;
+          for (const task of tasks) {
+            const straight = haversineMeters(
+              task.pair.originLat,
+              task.pair.originLng,
+              task.pair.destLat,
+              task.pair.destLng
+            );
+            const slopeFactor = Math.max(
+              1,
+              task.baseInfo.busEffectiveDistanceMeters /
+                Math.max(task.baseInfo.busStraightDistanceMeters, 1)
+            );
+            const eff = straight * slopeFactor;
+            if (eff < task.baseInfo.busEffectiveDistanceMeters) {
+              task.stop.buildingDistances.set(task.buildingId, eff);
+            }
+          }
+        } finally {
+          if (!cancelled && evalGen === customStopEvalGeneration) {
+            setIsEvaluatingCustomStops(false);
+            reapplyCustomStopScoresToBuildings();
+          }
+        }
+      }
+
+      function scheduleCustomStopEvaluation(delayMs = 80) {
+        if (customStops.length === 0) return;
+        if (customStopEvalTimer) clearTimeout(customStopEvalTimer);
+        customStopEvalTimer = setTimeout(() => {
+          customStopEvalTimer = null;
+          void evaluatePendingBuildingsForCustomStops();
+        }, delayMs);
+      }
+
+      function reindexCustomStops() {
+        customStops.forEach((stop, index) => {
+          const num = index + 1;
+          stop.label = `仮設停留所 #${num}`;
+          stop.entity.name = stop.label;
+          if (stop.entity.billboard) {
+            stop.entity.billboard.image = new Cesium.ConstantProperty(
+              createCustomStopPinIconDataUrl(num)
+            );
+          }
+        });
+      }
+
+      function addCustomStop(lat: number, lng: number) {
+        const id = nextCustomStopId++;
+        const num = customStops.length + 1;
+        const label = `仮設停留所 #${num}`;
+        const entity = viewer.entities.add({
+          name: label,
+          position: Cesium.Cartesian3.fromDegrees(lng, lat),
+          properties: { isCustomStop: true, customStopId: id },
+          billboard: {
+            image: createCustomStopPinIconDataUrl(num),
+            width: 28,
+            height: 28,
+            verticalOrigin: Cesium.VerticalOrigin.CENTER,
+            heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            eyeOffset: new Cesium.Cartesian3(0, 0, -100),
+          },
+        });
+        customStops.push({
+          id,
+          label,
+          lat,
+          lng,
+          entity,
+          buildingDistances: new Map(),
+          evaluatedBuildingIds: new Set(),
+        });
+        void evaluatePendingBuildingsForCustomStops();
+      }
+
+      function removeCustomStop(id: number) {
+        const idx = customStops.findIndex((s) => s.id === id);
+        if (idx < 0) return;
+        const [removed] = customStops.splice(idx, 1);
+        viewer.entities.remove(removed.entity);
+        reindexCustomStops();
+        ++customStopEvalGeneration;
+        setIsEvaluatingCustomStops(false);
+        ++popupRequestRef.current;
+        setPopup(null);
+        reapplyCustomStopScoresToBuildings();
+      }
+
+      function undoLastCustomStop() {
+        if (customStops.length === 0) return;
+        const last = customStops[customStops.length - 1];
+        removeCustomStop(last.id);
+      }
+
+      function clearCustomStops() {
+        for (const stop of customStops) {
+          viewer.entities.remove(stop.entity);
+        }
+        customStops = [];
+        nextCustomStopId = 1;
+        ++customStopEvalGeneration;
+        setIsEvaluatingCustomStops(false);
+        ++popupRequestRef.current;
+        setPopup(null);
+        reapplyCustomStopScoresToBuildings();
+      }
+
+      function flyToCustomStop(id: number) {
+        const stop = customStops.find((s) => s.id === id);
+        if (!stop) return;
+        const center = Cesium.Cartesian3.fromDegrees(stop.lng, stop.lat);
+        const sphere = new Cesium.BoundingSphere(center, 550);
+        viewer.camera.flyToBoundingSphere(sphere, {
+          offset: new Cesium.HeadingPitchRange(
+            Cesium.Math.toRadians(INITIAL_VIEW_HEADING),
+            Cesium.Math.toRadians(INITIAL_VIEW_PITCH)
+          ),
+          duration: 0.9,
+        });
+      }
+
+      function exportCustomStopSimulationGeoJson() {
+        if (customStops.length === 0) return;
+
+        const stopExportItems: CustomStopExportItem[] = customStops.map((stop) => {
+          const stat = customStopSummaryRef.current?.perStopStats.find((s) => s.id === stop.id);
+          return {
+            id: stop.id,
+            label: stop.label,
+            lat: stop.lat,
+            lng: stop.lng,
+            standaloneCoveredBuildings: stat?.standaloneCoveredBuildings ?? 0,
+            primaryCoveredBuildings: stat?.primaryCoveredBuildings ?? 0,
+          };
+        });
+
+        const newlyCoveredBuildings: NewlyCoveredBuildingExportItem[] = [];
+        for (const [buildingId, cached] of buildingScoreCache) {
+          if (cached.info.customStopImprovement?.isNewlyCovered) {
+            const imp = cached.info.customStopImprovement;
+            newlyCoveredBuildings.push({
+              buildingId,
+              lat: cached.baseInfo.lat,
+              lng: cached.baseInfo.lng,
+              usage: cached.baseInfo.usage,
+              totalFloorArea: cached.baseInfo.totalFloorArea,
+              assignedStopLabel: imp.stopLabel,
+              originalNearestStopName: cached.baseInfo.nearestStopName,
+              beforeBusEffectiveDistanceMeters: cached.baseInfo.busEffectiveDistanceMeters,
+              afterBusEffectiveDistanceMeters: imp.afterBusEffectiveDistanceMeters,
+              beforeBusWalkMinutes: cached.baseInfo.busWalkMinutes,
+              afterBusWalkMinutes: imp.afterBusWalkMinutes,
+              walkProfileLabel: cached.baseInfo.walkProfileLabel,
+            });
+          }
+        }
+
+        const geoJson = buildCustomStopSimulationGeoJson({
+          stops: stopExportItems,
+          newlyCoveredBuildings,
+        });
+
+        const timestamp = formatExportTimestamp();
+        void saveGeoJsonFile(geoJson, `plateau_simulation_${timestamp}.geojson`);
+      }
+
+      removeCustomStopRef.current = removeCustomStop;
+      undoLastCustomStopRef.current = undoLastCustomStop;
+      clearCustomStopsRef.current = clearCustomStops;
+      flyToCustomStopRef.current = flyToCustomStop;
+      reapplyCustomStopScoresRef.current = reapplyCustomStopScoresToBuildings;
+      exportCustomStopSimulationGeoJsonRef.current = exportCustomStopSimulationGeoJson;
+
+      function exportMobilityHubSimulationGeoJson() {
+        const activeHubs = MOBILITY_HUB_CANDIDATES.filter((h) =>
+          activeMobilityHubIdsRef.current.includes(h.id)
+        );
+        const records: MobilityHubBuildingRecord[] = [];
+        for (const [buildingId, cached] of buildingScoreCache.entries()) {
+          records.push({
+            buildingId,
+            lat: cached.baseInfo.lat,
+            lng: cached.baseInfo.lng,
+            baseCoverageRatio: cached.baseInfo.coverageRatio,
+            totalFloorArea: cached.baseInfo.totalFloorArea,
+            baseBusEffectiveDistanceMeters: cached.baseInfo.busEffectiveDistanceMeters,
+            usage: cached.baseInfo.usage,
+          });
+        }
+        const minMeters = mobilityHubMinMetersRef.current;
+        const maxMeters = mobilityHubMaxMetersRef.current;
+        const modeKey = mobilityHubModeRef.current;
+        const modeDef = MOBILITY_HUB_MODES.find((m) => m.id === modeKey);
+        const modeLabel = modeDef?.label ?? "自由設定";
+
+        const hubConfigs = new Map<number, MobilityHubSiteConfig>();
+        for (const hub of activeHubs) {
+          const hMode = hubModesRef.current[hub.id] ?? modeKey;
+          const hDef = MOBILITY_HUB_MODES.find((m) => m.id === hMode);
+          const hMin = hMode === "custom" ? minMeters : (hDef?.minMeters ?? minMeters);
+          const hMax = hMode === "custom" ? maxMeters : (hDef?.maxMeters ?? maxMeters);
+          hubConfigs.set(hub.id, {
+            hubId: hub.id,
+            mode: hMode,
+            minDistanceMeters: hMin,
+            maxDistanceMeters: hMax,
+          });
+        }
+
+        const { outcomes } = evaluateMobilityHubSimulation(
+          records,
+          activeHubs,
+          minMeters,
+          maxMeters,
+          modeKey,
+          hubConfigs
+        );
+
+        const coveredBuildings: MobilityHubCoveredBuildingExportItem[] = [];
+        for (const r of records) {
+          const outcome = outcomes.get(r.buildingId);
+          if (outcome && outcome.isCoveredByHub && outcome.nearestHubName != null) {
+            coveredBuildings.push({
+              buildingId: r.buildingId,
+              lat: r.lat,
+              lng: r.lng,
+              usage: r.usage,
+              totalFloorArea: r.totalFloorArea,
+              nearestHubName: outcome.nearestHubName,
+              hubDistanceMeters: outcome.hubDistanceMeters,
+              originalBusDistanceMeters: r.baseBusEffectiveDistanceMeters,
+              appliedModeLabel: outcome.modeLabel,
+            });
+          }
+        }
+
+        const geoJson = buildMobilityHubSimulationGeoJson({
+          hubs: activeHubs,
+          modeLabel,
+          minDistanceMeters: minMeters,
+          maxDistanceMeters: maxMeters,
+          coveredBuildings,
+        });
+
+        const timestamp = formatExportTimestamp();
+        void saveGeoJsonFile(
+          geoJson,
+          `mobility_hub_simulation_${modeKey}_${minMeters}m-${maxMeters}m_${timestamp}.geojson`
+        );
+      }
+
+      function flyToMobilityHub(hubId: number) {
+        const hub = MOBILITY_HUB_CANDIDATES.find((h) => h.id === hubId);
+        if (!hub) return;
+        const center = Cesium.Cartesian3.fromDegrees(hub.lng, hub.lat);
+        viewer.camera.flyToBoundingSphere(new Cesium.BoundingSphere(center, 700), {
+          offset: new Cesium.HeadingPitchRange(
+            viewer.camera.heading,
+            Cesium.Math.toRadians(-35),
+            1000
+          ),
+          duration: 1.0,
+        });
+      }
+
+      reapplyMobilityHubScoresRef.current = reapplyMobilityHubScoresToBuildings;
+      flyToMobilityHubRef.current = flyToMobilityHub;
+      exportMobilityHubGeoJsonRef.current = exportMobilityHubSimulationGeoJson;
+
+      // デマンド交通乗り場候補（k-meansのクラスタ重心）を紫の四角ピンで表示する。
+      // 建物のスコア計算が進むたびに（buildingScoreCacheが更新されるたびに）再クラスタリングする
+      // 必要があるため、候補ピンの実体（Entity）とクラスタ内訳（members）を紐付けて保持しておく
+      // （クリック時に「対象建物数」「現状の平均実効距離」を即座に表示するため）。
+      // busEffectiveDistanceMetersを表示用に保持している（対象建物のほとんどはバス距離が
+      // カバー率のボトルネックになるため、代表的な指標として引き続きバス実効距離を見せる。
+      // 抽出基準そのものはcoverageRatioの閾値なので、駅が近くバスが遠い建物も理論上は含まれ得る）。
+      type DemandTransitCandidate = {
+        entity: Cesium.Entity;
+        centroidLat: number;
+        centroidLng: number;
+        members: DemandTransitMember[];
+        estimatedAfter?: number;
+      };
+      let demandTransitCandidates: DemandTransitCandidate[] = [];
+      // 比較ボタンを押した後は、表示範囲に依存するbuildingScoreCacheではなく藤沢市北部全域の
+      // 建物をここに保持し、グラフの各案と同じ母集団から紫の候補ピンを描く。
+      let demandTransitAnalysisMembers: DemandTransitMember[] | null = null;
+      let demandTransitAnalysisSites: DemandTransitPlanSite[] | null = null;
+      let demandTransitRecomputeTimer: ReturnType<typeof setTimeout> | null = null;
+      // クリックのたびにインクリメントし、非同期の「新設した場合の推定実効距離」計算が
+      // 完了した時点で最新のクリックと一致するかを確認する（古いリクエストの結果で
+      // ポップアップを上書きしないようにするため）。
+
+      const demandTransitIconUrl = createSquareIconDataUrl(DEMAND_TRANSIT_COLOR);
+
+      function recomputeDemandTransitCandidates() {
+        if (cancelled) return;
+        ++popupRequestRef.current;
+        if (candidatePopupRef.current) { setPopup(null); candidatePopupRef.current = false; }
+        const gapBuildings: DemandTransitMember[] = demandTransitAnalysisMembers
+          ? demandTransitAnalysisMembers
+          : [];
+        if (!demandTransitAnalysisMembers) {
+          for (const { baseInfo } of buildingScoreCache.values()) {
+            if (baseInfo.coverageRatio > DEMAND_TRANSIT_GAP_RATIO_THRESHOLD) {
+              gapBuildings.push({
+                lat: baseInfo.lat,
+                lng: baseInfo.lng,
+                busStraightDistanceMeters: baseInfo.busStraightDistanceMeters,
+                busEffectiveDistanceMeters: baseInfo.busEffectiveDistanceMeters,
+                stationEffectiveDistanceMeters: baseInfo.stationEffectiveDistanceMeters,
+                coverageRatio: baseInfo.coverageRatio,
+              });
+            }
+          }
+        }
+
+        // 既存の候補ピンをいったん全部消してから作り直す（差分更新は複雑になるため単純化）。
+        for (const candidate of demandTransitCandidates) {
+          viewer.entities.remove(candidate.entity);
+        }
+        demandTransitCandidates = [];
+
+        if (!SHOW_AUTO_CANDIDATE_AND_COMPARISON_UI) return;
+        if (gapBuildings.length < DEMAND_TRANSIT_MIN_BUILDINGS) return;
+
+        const refLat = gapBuildings.reduce((sum, b) => sum + b.lat, 0) / gapBuildings.length;
+        const refLng = gapBuildings.reduce((sum, b) => sum + b.lng, 0) / gapBuildings.length;
+        const projected = gapBuildings.map((b) => projectToLocalMeters(b.lat, b.lng, refLat, refLng));
+        let clusters: { centroid: [number, number]; indices: number[] }[];
+        if (demandTransitAnalysisSites) {
+          // 全域比較で選んだ地点をそのまま使い、各建物を最も近い選択済み地点へ割り当てる。
+          // これにより、地図の紫ピンとグラフの同じ行が完全に対応する。
+          const selectedSites = demandTransitAnalysisSites.slice(0, demandTransitClusterCountRef.current);
+          const sitePoints = selectedSites.map((site) => projectToLocalMeters(site.lat, site.lng, refLat, refLng));
+          const indices = sitePoints.map(() => [] as number[]);
+          projected.forEach((point, buildingIndex) => {
+            let closestSite = 0;
+            let closestDistance = Infinity;
+            sitePoints.forEach((sitePoint, siteIndex) => {
+              const dx = point[0] - sitePoint[0];
+              const dy = point[1] - sitePoint[1];
+              const distance = dx * dx + dy * dy;
+              if (distance < closestDistance) {
+                closestDistance = distance;
+                closestSite = siteIndex;
+              }
+            });
+            if (sitePoints.length > 0) indices[closestSite].push(buildingIndex);
+          });
+          clusters = sitePoints.map((centroid, index) => ({ centroid, indices: indices[index] }));
+        } else {
+          clusters = kMeans(projected, demandTransitClusterCountRef.current);
+        }
+
+        for (const [clusterIndex, cluster] of clusters.entries()) {
+          const [centroidLat, centroidLng] = unprojectFromLocalMeters(
+            cluster.centroid[0],
+            cluster.centroid[1],
+            refLat,
+            refLng
+          );
+          const members = cluster.indices.map((i) => gapBuildings[i]);
+          if (!members.length) continue;
+          const entity = viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(centroidLng, centroidLat),
+            properties: { isDemandTransitCandidate: true },
+            billboard: {
+              image: demandTransitIconUrl,
+              width: 22,
+              height: 22,
+              verticalOrigin: Cesium.VerticalOrigin.CENTER,
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+              // CLAMP_TO_GROUNDは地形面には正しく貼り付くが、3D Tiles建物が候補地点の
+              // 真上にあるとその陰に隠れてしまうことがあるため、深度テストを無効化して
+              // 常に手前に表示されるようにする（バス停ピンは建物の少ない場所に置かれがちで
+              // 目立たなかったが、この候補ピンは密集市街地の中心に来ることが多いため必要）。
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            },
+          });
+          const distances = demandTransitAnalysisSites?.[clusterIndex]?.distances;
+          const estimatedAfter = distances && members.length ? cluster.indices.reduce((sum,i) =>
+            sum + Math.min(gapBuildings[i].busEffectiveDistanceMeters, distances[i]),0)/members.length : undefined;
+          demandTransitCandidates.push({ entity, centroidLat, centroidLng, members, estimatedAfter });
+        }
+      }
+
+      function scheduleDemandTransitRecompute() {
+        if (demandTransitRecomputeTimer) clearTimeout(demandTransitRecomputeTimer);
+        demandTransitRecomputeTimer = setTimeout(() => {
+          demandTransitRecomputeTimer = null;
+          recomputeDemandTransitCandidates();
+        }, DEMAND_TRANSIT_RECOMPUTE_DEBOUNCE_MS);
+      }
+      // スライダー操作（Reactのイベントハンドラ、このクロージャの外側）から再計算を
+      // トリガーできるようにrefへ登録しておく。
+      scheduleDemandTransitRecomputeRef.current = scheduleDemandTransitRecompute;
+      // 比較用の全域データを必要な時だけ読む。78,542棟ぶんの事前計算ファイルは42MBあるため、
+      // 通常の地図表示・建物色分けだけを見る利用者にはダウンロードさせない。
+      let networkScoresPromise: Promise<Map<string, BuildingNetworkScoreRow> | null> | null = null;
+      async function ensureNetworkScoreMap(): Promise<Map<string, BuildingNetworkScoreRow> | null> {
+        if (networkScoreMap) return networkScoreMap;
+        if (networkScoresPromise) return networkScoresPromise;
+        setLoadingNetworkScores(true);
+        networkScoresPromise = (async () => {
+          try {
+            const res = await fetch(BUILDING_NETWORK_SCORES_JSON_URL);
+            if (!res.ok) throw new Error(`network scores: ${res.status}`);
+            const rows: BuildingNetworkScoreRow[] = await res.json();
+            if (cancelled) return null;
+            networkScoreMap = new Map(rows.map(row => [row.buildingId, row]));
+            return networkScoreMap;
+          } catch (error) {
+            console.warn('道路網データの取得に失敗しました', error);
+            return null;
+          } finally {
+            networkScoresPromise = null;
+            if (!cancelled) setLoadingNetworkScores(false);
+          }
+        })();
+        return networkScoresPromise;
+      }
+
+      // 全域比較はWorkerで実行。道路網モデルは選択候補を同じ道路網で再評価する。
+      let demandTransitAnalysisTimer: number | null = null;
+      let demandTransitAnalysisRunId = 0;
+      let analysisWorker: Worker | null = null;
+      let analysisRequested = false;
+      function runDemandTransitAnalysis(runId: number) {
+        if (cancelled || runId !== demandTransitAnalysisRunId) return;
+        analysisWorker?.terminate();
+        setAnalysisError(null);
+        const thresholdMultiplier = demandTransitAnalysisThresholdMultiplierRef.current;
+        const worker = new Worker(new URL('./workers/transit-analysis.worker.ts', import.meta.url));
+        analysisWorker = worker;
+        const fail = (message: string) => {
+          if (cancelled || runId !== demandTransitAnalysisRunId) return;
+          worker.terminate();
+          analysisWorker = null;
+          setAnalysisError(message);
+          setIsDemandTransitAnalysisRunning(false);
+          setDemandTransitPlanAnalysis(null);
+          demandTransitAnalysisMembers = null;
+          demandTransitAnalysisSites = null;
+          scheduleDemandTransitRecompute();
+        };
+        worker.onerror = () => fail('比較処理に失敗しました。「比較グラフを表示」から再試行できます。');
+        worker.onmessage = (event: MessageEvent<AnalysisResponse>) => {
+          if (cancelled || runId !== demandTransitAnalysisRunId) return;
+          const data = event.data;
+          if ('error' in data) { fail(data.error); return; }
+          worker.terminate();
+          analysisWorker = null;
+          demandTransitAnalysisMembers = data.members;
+          demandTransitAnalysisSites = data.sites;
+          if (!data.results.length) {
+            setAnalysisError('この条件では比較対象の交通空白地がありません。');
+            setDemandTransitPlanAnalysis(null);
+          } else {
+            setDemandTransitPlanAnalysis({targetBuildingCount:data.members.length,
+              scopeLabel:`藤沢市北部全域（住宅系建物${data.total.toLocaleString()}棟）`,
+              methodLabel:data.methodLabel, thresholdMultiplier, results:data.results});
+          }
+          recomputeDemandTransitCandidates();
+          setIsDemandTransitAnalysisRunning(false);
+        };
+        worker.postMessage({profile:walkProfileRef.current,model:distanceModelRef.current,
+          thresholdMultiplier,stops:majorOperatorStopList,stations:trainStationList});
+      }
+      function scheduleDemandTransitAnalysis(delayMs = 450) {
+        analysisRequested = true;
+        analysisWorker?.terminate();
+        analysisWorker = null;
+        ++popupRequestRef.current;
+        setPopup(null);
+        demandTransitAnalysisRunId++;
+        const scheduledRunId = demandTransitAnalysisRunId;
+        if (demandTransitAnalysisTimer) window.clearTimeout(demandTransitAnalysisTimer);
+        setIsDemandTransitAnalysisRunning(true);
+        demandTransitAnalysisTimer = window.setTimeout(() => {
+          demandTransitAnalysisTimer = null;
+          void runDemandTransitAnalysis(scheduledRunId);
+        }, delayMs);
+      }
+      scheduleDemandTransitAnalysisRef.current = scheduleDemandTransitAnalysis;
+      // 起動時は全域データの読み込みと数千万回の計算を走らせず、ユーザーが「比較グラフを表示」を
+      // 押したときに初めて遅延実行する（起動負荷と地名ラベルの脱落を防止するため）。
+
+      async function processTile(tile: Cesium.Cesium3DTile, generation: number): Promise<boolean> {
+        if (tokaidoLinePoints.length === 0 || majorOperatorStopList.length === 0 || trainStationList.length === 0) return false;
+        if (cancelled) return false;
+        if (distanceModelRef.current === 'network' && !networkScoreMap) return false;
+        const content = tile.content;
+        const isCurrent = () => !cancelled && generation === tileWork.generation && tile.content === content;
+        if (!content || content.featuresLength === 0) return true;
+        loadedTiles.add(tile);
+
+        type Candidate = {
+          feature: Cesium.Cesium3DTileFeature;
+          buildingId: string;
+          lng: number;
+          lat: number;
+          usage: string;
+          totalFloorArea: number | null;
+        };
+        const candidates: Candidate[] = [];
+
+        for (let i = 0; i < content.featuresLength; i++) {
+          const feature = content.getFeature(i);
+          const usage = feature.getProperty("bldg:usage") as string | undefined;
+          if (!usage || !usage.includes(RESIDENTIAL_USAGE_SUBSTRING)) continue;
+          const lng = feature.getProperty("_x") as number | undefined;
+          const lat = feature.getProperty("_y") as number | undefined;
+          if (typeof lng !== "number" || typeof lat !== "number") continue;
+          if (!isNorthOfTokaidoLine(tokaidoLinePoints, lng, lat)) continue;
+
+          const buildingId =
+            (feature.getProperty("uro:BuildingIDAttribute_uro:buildingID") as string | undefined) ??
+            `${lng},${lat}`;
+
+          const cached = buildingScoreCache.get(buildingId);
+          if (cached) {
+            feature.color = cached.color;
+            featureScoreMap.set(feature, cached.info);
+            continue;
+          }
+          feature.color = Cesium.Color.WHITE;
+          featureScoreMap.delete(feature);
+          if (buildingScoreCache.size + candidates.length >= MAX_SCORED_BUILDINGS) continue;
+
+          const totalFloorArea = feature.getProperty(
+            "uro:BuildingDetailAttribute_uro:totalFloorArea"
+          ) as number | null | undefined;
+          candidates.push({ feature, buildingId, lng, lat, usage, totalFloorArea: totalFloorArea ?? null });
+        }
+
+        if (candidates.length === 0) return true;
+
+        const profile = WALK_PROFILES[walkProfileRef.current];
+
+        // buildingScoreCache/featureScoreMapへの登録・色付け・カウンタ更新を1箇所にまとめた
+        // ヘルパー。直線距離モデル（ライブ計算）・道路網距離モデル（事前計算データ）の
+        // どちらの経路からも同じ形で呼べるようにしている。
+        function recordScore(feature: Cesium.Cesium3DTileFeature, buildingId: string, info: BuildingScoreInfo) {
+          if (!isCurrent()) return;
+          const color = colorForCoverageRatio(info.coverageRatio);
+          feature.color = color;
+          buildingScoreCache.set(buildingId, { baseColor: color, baseInfo: info, color, info });
+          featureScoreMap.set(feature, info);
+        }
+
+        // 【実験的】道路網距離モデルが選択されていて事前計算データが読み込み済みなら、該当する
+        // 建物はそちらの数値をそのまま使う（地形サンプリング不要）。事前計算データに無い建物
+        // （オフライン抽出との差分等）は未評価のまま残し、距離モデルを混在させない。
+        let liveCandidates = candidates;
+        if (distanceModelRef.current === "network" && networkScoreMap) {
+          liveCandidates = [];
+          for (const c of candidates) {
+            const row = networkScoreMap.get(c.buildingId);
+            if (!row) {
+              continue;
+            }
+            const busEff =
+              walkProfileRef.current === "general" ? row.busEffectiveDistanceM_general : row.busEffectiveDistanceM_elderly;
+            const stationEff =
+              walkProfileRef.current === "general"
+                ? row.stationEffectiveDistanceM_general
+                : row.stationEffectiveDistanceM_elderly;
+            // 事前計算済みのrow.coverageRatio_*（固定300m/600m基準で焼き込み済み）はそのまま
+            // 使わず、閾値倍率スライダーの現在値を反映してその場で計算し直す（道路網距離は
+            // 系統的に長くなるため、倍率>1で判定を緩められるようにする。上のコメント参照）。
+            const multiplier = networkThresholdMultiplierRef.current;
+            const coverageRatio = Math.min(
+              busEff / (BUS_COVERAGE_THRESHOLD_METERS * multiplier),
+              stationEff / (STATION_COVERAGE_THRESHOLD_METERS * multiplier)
+            );
+            const info: BuildingScoreInfo = {
+              usage: c.usage,
+              lat: c.lat,
+              lng: c.lng,
+              nearestStopName: row[`nearestStopName_${walkProfileRef.current}`],
+              // 道路網距離モデルには「直線距離」の概念が無いため、勾配加味前の道路網距離を代用する
+              // （現状のUIはこの値を表示していないため実用上の影響はない）。
+              busStraightDistanceMeters: walkProfileRef.current === "general" ? row.busNetworkDistanceM : row.busNetworkDistanceM_elderly,
+              busEffectiveDistanceMeters: busEff,
+              busWalkMinutes: busEff / profile.walkSpeedMPerMin,
+              nearestStationName: row[`nearestStationName_${walkProfileRef.current}`],
+              stationStraightDistanceMeters: walkProfileRef.current === "general" ? row.stationNetworkDistanceM : row.stationNetworkDistanceM_elderly,
+              stationEffectiveDistanceMeters: stationEff,
+              stationWalkMinutes: stationEff / profile.walkSpeedMPerMin,
+              coverageRatio,
+              isCovered: coverageRatio <= 1,
+              totalFloorArea: c.totalFloorArea,
+              walkProfileLabel: `${profile.label}（道路網距離モデル）`,
+            };
+            recordScore(c.feature, c.buildingId, info);
+          }
+        }
+
+        if (liveCandidates.length === 0) {
+          scheduleDemandTransitRecompute();
+          scheduleCustomStopEvaluation();
+          scheduleMobilityHubSimulation();
+          return true;
+        }
+
+        // 各建物の最寄りバス停・最寄り駅を探す。バス停は主要事業者のみを対象にする
+        // （理由は上のMAJOR_OPERATOR_KEYWORDSのコメント参照）。駅は5件のみなのでどちらも
+        // 総当たりで十分速い。
+        const withNearest = liveCandidates.map((c) => {
+          let bestStop: BusStop | null = null;
+          let bestStopDist = Infinity;
+          for (const stop of majorOperatorStopList) {
+            const d = haversineMeters(c.lat, c.lng, stop.lat, stop.lng);
+            if (d < bestStopDist) {
+              bestStopDist = d;
+              bestStop = stop;
+            }
+          }
+          let bestStation: TrainStation | null = null;
+          let bestStationDist = Infinity;
+          for (const station of trainStationList) {
+            const d = haversineMeters(c.lat, c.lng, station.lat, station.lng);
+            if (d < bestStationDist) {
+              bestStationDist = d;
+              bestStation = station;
+            }
+          }
+          return { ...c, nearestStop: bestStop as BusStop, nearestStation: bestStation as TrainStation };
+        });
+
+        // バス用ペア・駅用ペアを1つの配列に連結し、地形サンプリングを1回のバッチ呼び出しに
+        // まとめる（既存の「タイル単位でバッチ化する」方針を維持。前半がバス、後半が駅の結果）。
+        // 勾配感度（プロファイル）はこの時点のwalkProfileRef.currentを使う。プロファイル切替時は
+        // applyWalkProfileがbuildingScoreCacheを空にしてから全読み込み済みタイルでprocessTileを
+        // 呼び直すため、ここで最新の値を読めば自動的に新プロファイルで再計算される（profileは
+        // このprocessTile関数の先頭で既に取得済み）。
+        let results: EffectiveDistanceResult[];
+        try {
+          const busPairs = withNearest.map((c) => ({
+            originLat: c.lat,
+            originLng: c.lng,
+            destLat: c.nearestStop.lat,
+            destLng: c.nearestStop.lng,
+          }));
+          const stationPairs = withNearest.map((c) => ({
+            originLat: c.lat,
+            originLng: c.lng,
+            destLat: c.nearestStation.lat,
+            destLng: c.nearestStation.lng,
+          }));
+          results = await computeEffectiveDistances(
+            terrainProvider,
+            [...busPairs, ...stationPairs],
+            profile.slopePenaltyFactor
+          );
+        } catch (err) {
+          console.warn(
+            "傾斜計算用の地形サンプリングに失敗しました。このタイルの建物群はスコア計算をスキップします。",
+            err
+          );
+          return false;
+        }
+        if (!isCurrent()) return false;
+
+        const n = withNearest.length;
+        withNearest.forEach((c, idx) => {
+          const { straightDistanceMeters: busStraightDistanceMeters, effectiveDistanceMeters: busEffectiveDistanceMeters } =
+            results[idx];
+          const {
+            straightDistanceMeters: stationStraightDistanceMeters,
+            effectiveDistanceMeters: stationEffectiveDistanceMeters,
+          } = results[n + idx];
+          const busWalkMinutes = busEffectiveDistanceMeters / profile.walkSpeedMPerMin;
+          const stationWalkMinutes = stationEffectiveDistanceMeters / profile.walkSpeedMPerMin;
+          const coverageRatio = Math.min(
+            busEffectiveDistanceMeters / BUS_COVERAGE_THRESHOLD_METERS,
+            stationEffectiveDistanceMeters / STATION_COVERAGE_THRESHOLD_METERS
+          );
+          const isCovered = coverageRatio <= 1;
+          const info: BuildingScoreInfo = {
+            usage: c.usage,
+            lat: c.lat,
+            lng: c.lng,
+            nearestStopName: c.nearestStop.name,
+            busStraightDistanceMeters,
+            busEffectiveDistanceMeters,
+            busWalkMinutes,
+            nearestStationName: c.nearestStation.name,
+            stationStraightDistanceMeters,
+            stationEffectiveDistanceMeters,
+            stationWalkMinutes,
+            coverageRatio,
+            isCovered,
+            totalFloorArea: c.totalFloorArea,
+            walkProfileLabel: profile.label,
+          };
+          recordScore(c.feature, c.buildingId, info);
+        });
+
+        scheduleDemandTransitRecompute();
+        scheduleCustomStopEvaluation();
+        scheduleMobilityHubSimulation();
+        return true;
+      }
+
+      // 読み込み・表示の両イベントで、未処理または再試行時刻を迎えたタイルだけ評価。
+      function processTileIfNeeded(tile: Cesium.Cesium3DTile) {
+        if (cancelled) return;
+        void tileWork.run(tile, generation => processTile(tile, generation));
+      }
+      const removeLoad = tileset?.tileLoad.addEventListener(processTileIfNeeded);
+      const removeVisible = tileset?.tileVisible.addEventListener(processTileIfNeeded);
+      const removeUnload = tileset?.tileUnload.addEventListener(tile => {
+        loadedTiles.delete(tile);
+        tileWork.forget(tile);
+      });
+
+      function invalidateScores() {
+        const generation = tileWork.invalidate();
+        buildingScoreCache.clear();
+        featureScoreMap = new WeakMap();
+        loadedTiles.clear();
+        ++customStopEvalGeneration;
+        for (const stop of customStops) {
+          stop.buildingDistances.clear();
+          stop.evaluatedBuildingIds.clear();
+          delete stop.routedNodeDistances;
+        }
+        ++popupRequestRef.current;
+        setPopup(null);
+        demandTransitAnalysisMembers = null;
+        demandTransitAnalysisSites = null;
+        scheduleDemandTransitRecompute();
+        scheduleMobilityHubSimulation();
+        if (analysisRequested) scheduleDemandTransitAnalysis();
+        return generation;
+      }
+      async function applyWalkProfile(profile: WalkProfile) {
+        walkProfileRef.current = profile;
+        clearRouteComparisonEntities();
+        const generation = invalidateScores();
+        await new Promise<void>(resolve => window.setTimeout(resolve, 800));
+        if (!cancelled && generation === tileWork.generation) setCenterLoading(null);
+      }
+      applyWalkProfileRef.current = profile => { void applyWalkProfile(profile); };
+      async function applyDistanceModel(model: DistanceModel) {
+        distanceModelRef.current = model;
+        clearRouteComparisonEntities();
+        const generation = invalidateScores();
+        if (model === 'network') {
+          const scores = await ensureNetworkScoreMap();
+          if (cancelled || distanceModelRef.current !== model) return;
+          if (!scores) {
+            distanceModelRef.current = 'straight';
+            setDistanceModel('straight');
+            invalidateScores();
+            setCenterLoading(null);
+            setAnalysisError('道路網データを取得できなかったため、直線距離表示に戻しました。');
+          }
+        }
+        if (!cancelled && generation === tileWork.generation && distanceModelRef.current === model) setCenterLoading(null);
+      }
+      applyDistanceModelRef.current = model => { void applyDistanceModel(model); };
+      applyNetworkThresholdMultiplierRef.current = multiplier => {
+        networkThresholdMultiplierRef.current = multiplier;
+        invalidateScores();
+      };
+      disposeRuntime = () => {
+        removeLoad?.(); removeVisible?.(); removeUnload?.();
+        clickHandler.destroy();
+        analysisWorker?.terminate();
+        clearRouteComparisonEntities();
+        if (demandTransitRecomputeTimer) clearTimeout(demandTransitRecomputeTimer);
+        if (demandTransitAnalysisTimer) clearTimeout(demandTransitAnalysisTimer);
+        if (customStopEvalTimer) clearTimeout(customStopEvalTimer);
+        if (mobilityHubSimulationTimer) clearTimeout(mobilityHubSimulationTimer);
+        tileWork.invalidate();
+      };
+
+      // Cesium標準のクリック選択（selectionIndicator/infoBox）は無効化しているため、
+      // バス停・建物クリック時の情報表示は自前のInfoPopupで行う。
+      const clickHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+      clickHandler.setInputAction((movement: Cesium.ScreenSpaceEventHandler.PositionedEvent) => {
+        ++popupRequestRef.current;
+        candidatePopupRef.current = false;
+        clearRouteComparisonEntities();
+        const picked = viewer.scene.pick(movement.position);
+        const entity = picked?.id;
+
+        if (entity instanceof Cesium.Entity && entity.properties?.isCustomStop?.getValue()) {
+          const customStopId: number = entity.properties.customStopId?.getValue();
+          const stop = customStops.find((s) => s.id === customStopId);
+          if (!stop) {
+            setPopup(null);
+            return;
+          }
+          const requestId = ++popupRequestRef.current;
+          const effectiveMultiplier =
+            distanceModelRef.current === "network"
+              ? networkThresholdMultiplierRef.current
+              : demandTransitAnalysisThresholdMultiplierRef.current;
+          const busThreshold = BUS_COVERAGE_THRESHOLD_METERS * effectiveMultiplier;
+          let standaloneCount = 0;
+          for (const [buildingId, dist] of stop.buildingDistances.entries()) {
+            const cached = buildingScoreCache.get(buildingId);
+            if (cached && cached.baseInfo.coverageRatio > 1 && dist <= busThreshold) {
+              standaloneCount++;
+            }
+          }
+          let areaNameText = "取得中…";
+          const buildCustomStopLines = (): ReactNode[] => [
+            `推定地区名: ${areaNameText}`,
+            <span key="cov">
+              単独でカバー圏内に入る空白地建物:{" "}
+              <b style={{ color: "#38bdf8" }}>{standaloneCount}棟</b>
+            </span>,
+            <button
+              key="del"
+              type="button"
+              onClick={() => removeCustomStop(stop.id)}
+              style={{
+                marginTop: 6,
+                padding: "4px 10px",
+                fontSize: 12,
+                borderRadius: 4,
+                border: "1px solid rgba(248,113,113,0.6)",
+                background: "rgba(127,29,29,0.55)",
+                color: "#fecaca",
+                cursor: "pointer",
+              }}
+            >
+              この仮設停留所を削除
+            </button>,
+          ];
+          setPopup({ title: `${stop.label}（自由配置）`, lines: buildCustomStopLines() });
+
+          void (async () => {
+            try {
+              const res = await fetch(`/api/reverse-geocode?lat=${stop.lat}&lng=${stop.lng}`);
+              if (!res.ok) throw new Error(`reverse-geocode API returned ${res.status}`);
+              const data: { areaName: string | null } = await res.json();
+              if (cancelled || requestId !== popupRequestRef.current) return;
+              areaNameText = data.areaName ?? "不明";
+              setPopup({ title: `${stop.label}（自由配置）`, lines: buildCustomStopLines() });
+            } catch {
+              if (cancelled || requestId !== popupRequestRef.current) return;
+              areaNameText = "取得できませんでした";
+              setPopup({ title: `${stop.label}（自由配置）`, lines: buildCustomStopLines() });
+            }
+          })();
+          return;
+        }
+
+        if (isAddingCustomStopRef.current) {
+          if (isSnappingCustomStop) return;
+          const groundPos = pickGroundLatLng(viewer, movement.position);
+          if (groundPos) {
+            isSnappingCustomStop = true;
+            showRoadSnapNoticeRef.current("最寄りの道路位置を確認中…", false, {
+              autoDismissMs: null,
+              isPending: true,
+            });
+            void (async () => {
+              try {
+                // 追加モード開始時のウォームアップが進行中なら完了を待ち、サーバー側で
+                // コールドスタートが二重発生しないようにする。
+                if (snapRoadWarmupPromiseRef.current) {
+                  await snapRoadWarmupPromiseRef.current;
+                }
+                if (cancelled) return;
+                const res = await fetch(
+                  `/api/snap-road?lat=${groundPos.lat}&lng=${groundPos.lng}&maxDistance=35`
+                );
+                if (cancelled) return;
+                if (!res.ok) {
+                  addCustomStop(groundPos.lat, groundPos.lng);
+                  showRoadSnapNoticeRef.current("指定地点に停留所を配置しました");
+                  return;
+                }
+                const data: {
+                  snapped: boolean;
+                  distanceMeters: number | null;
+                  snappedTo: { lat: number; lng: number } | null;
+                } = await res.json();
+                if (cancelled) return;
+
+                if (data.snapped && data.snappedTo) {
+                  addCustomStop(data.snappedTo.lat, data.snappedTo.lng);
+                  if (typeof data.distanceMeters === "number" && data.distanceMeters >= 3) {
+                    showRoadSnapNoticeRef.current(
+                      `最寄りの道路（${data.distanceMeters}m）に自動吸着して配置しました`
+                    );
+                  } else {
+                    showRoadSnapNoticeRef.current("道路上に停留所を配置しました");
+                  }
+                } else {
+                  const distInfo =
+                    typeof data.distanceMeters === "number"
+                      ? `（道路から約${data.distanceMeters}m）`
+                      : "";
+                  showRoadSnapNoticeRef.current(
+                    `道路がない場所には配置できません${distInfo}。道路沿いをクリックしてください`,
+                    true
+                  );
+                }
+              } catch {
+                if (!cancelled) {
+                  addCustomStop(groundPos.lat, groundPos.lng);
+                  showRoadSnapNoticeRef.current("指定地点に停留所を配置しました");
+                }
+              } finally {
+                isSnappingCustomStop = false;
+              }
+            })();
+          }
+          return;
+        }
+
+        if (entity instanceof Cesium.Entity && entity.properties?.isBusStop?.getValue()) {
+          const operator: string = entity.properties.operator?.getValue();
+          const routes: BusRoute[] = entity.properties.routes?.getValue() ?? [];
+          const lines = [`事業者: ${operator}`];
+          if (routes.length > 0) {
+            lines.push(`系統: ${routes.map((r) => r.name).join("、")}`);
+          }
+          setPopup({ title: entity.name ?? "バス停", lines });
+        } else if (entity instanceof Cesium.Entity && entity.properties?.isDemandTransitCandidate?.getValue()) {
+          const candidate = demandTransitCandidates.find((c) => c.entity === entity);
+          if (!candidate) {
+            setPopup(null);
+          } else {
+            candidatePopupRef.current = true;
+            const requestId = ++popupRequestRef.current;
+            const avgCurrentDistance =
+              candidate.members.reduce((sum, m) => sum + m.busEffectiveDistanceMeters, 0) / candidate.members.length;
+
+            // 地区名（逆ジオコーディング）と実効距離の再計算は互いに独立した非同期処理で、
+            // 完了したほうから順にポップアップへ反映する。両方の最新状態をこの2変数で保持し、
+            // どちらかが完了するたびに buildLines() で組み直したポップアップを表示する。
+            let areaNameText = "取得中…";
+            let newDistanceLine = "新設した場合の推定実効距離: 計算中…";
+            const buildLines = () => [
+              `推定地区名: ${areaNameText}`,
+              `対象建物数: ${candidate.members.length}棟`,
+              `現状の平均実効距離（バス基準）: 約${Math.round(avgCurrentDistance)}m`,
+              newDistanceLine,
+            ];
+
+            setPopup({ title: "デマンド交通 乗り場候補", lines: buildLines() });
+
+            // 逆ジオコーディング（サーバー側の/api/reverse-geocode経由でNominatimを呼ぶ）。
+            void (async () => {
+              try {
+                const res = await fetch(
+                  `/api/reverse-geocode?lat=${candidate.centroidLat}&lng=${candidate.centroidLng}`
+                );
+                if (!res.ok) throw new Error(`reverse-geocode API returned ${res.status}`);
+                const data: { areaName: string | null } = await res.json();
+                if (cancelled || requestId !== popupRequestRef.current) return;
+                areaNameText = data.areaName ?? "不明";
+                setPopup({ title: "デマンド交通 乗り場候補", lines: buildLines() });
+              } catch (err) {
+                console.warn("デマンド交通乗り場候補の地区名取得に失敗しました", err);
+                if (cancelled || requestId !== popupRequestRef.current) return;
+                areaNameText = "取得できませんでした";
+                setPopup({ title: "デマンド交通 乗り場候補", lines: buildLines() });
+              }
+            })();
+
+            // 実効距離の再計算（既存の傾斜込みアクセシビリティ計算と同じロジックを、
+            // 目的地だけ「クリックされた候補地点」に差し替えて呼び出す）。
+            void (async () => {
+              try {
+                if (candidate.estimatedAfter !== undefined) {
+                  newDistanceLine = `新設後の平均実効距離（比較と同じ計算）: 約${Math.round(candidate.estimatedAfter)}m`;
+                  if (!cancelled && requestId === popupRequestRef.current) setPopup({ title: "デマンド交通 乗り場候補", lines: buildLines() });
+                  return;
+                }
+                if (distanceModelRef.current === "network") {
+                  newDistanceLine = "道路網での効果は「比較グラフを表示」で計算してください";
+                  if (!cancelled && requestId === popupRequestRef.current) setPopup({ title: "デマンド交通 乗り場候補", lines: buildLines() });
+                  return;
+                }
+                const results = await computeEffectiveDistances(
+                  terrainProvider,
+                  candidate.members.map((m) => ({
+                    originLat: m.lat,
+                    originLng: m.lng,
+                    destLat: candidate.centroidLat,
+                    destLng: candidate.centroidLng,
+                  })),
+                  WALK_PROFILES[walkProfileRef.current].slopePenaltyFactor
+                );
+                // 計算中に別の候補がクリックされていたら、この結果は捨てて何もしない。
+                if (cancelled || requestId !== popupRequestRef.current) return;
+                const avgNewDistance =
+                  results.reduce((sum, r, i) => sum + Math.min(candidate.members[i].busEffectiveDistanceMeters, r.effectiveDistanceMeters), 0) / results.length;
+                newDistanceLine = `新設した場合の推定実効距離: 約${Math.round(avgNewDistance)}m`;
+                setPopup({ title: "デマンド交通 乗り場候補", lines: buildLines() });
+              } catch (err) {
+                console.warn("デマンド交通乗り場候補の再計算に失敗しました", err);
+                if (cancelled || requestId !== popupRequestRef.current) return;
+                newDistanceLine = "新設した場合の推定実効距離: 計算に失敗しました";
+                setPopup({ title: "デマンド交通 乗り場候補", lines: buildLines() });
+              }
+            })();
+          }
+        } else if (entity instanceof Cesium.Entity && entity.properties?.isExistingDemandTransit?.getValue()) {
+          const service: ExistingDemandTransitService = entity.properties.service.getValue();
+          const stopName: string = entity.properties.stopName.getValue();
+          setPopup({
+            title: `${service.name}（${stopName}）`,
+            lines: [
+              `種別: ${service.type}`,
+              `事業者: ${service.operator}`,
+              `運行開始: ${service.startDate}`,
+              service.description,
+              <a key="src" href={service.sourceUrl} target="_blank" rel="noreferrer" style={{ color: "#93c5fd" }}>
+                藤沢市公式ページ
+              </a>,
+            ],
+          });
+        } else if (entity instanceof Cesium.Entity && entity.properties?.isHelloCyclingStation?.getValue()) {
+          const capacity: number | null = entity.properties.capacity?.getValue() ?? null;
+          setPopup({
+            title: entity.name ?? "ハローサイクリング ステーション",
+            lines: [...(capacity != null ? [`収容可能台数: ${capacity}台`] : [])],
+          });
+        } else if (entity instanceof Cesium.Entity && entity.properties?.isMobilityHub?.getValue()) {
+          const hub: MobilityHubSite = entity.properties.hubData.getValue();
+          const hubMode = hubModesRef.current[hub.id] ?? mobilityHubModeRef.current;
+          const modeDef = MOBILITY_HUB_MODES.find((m) => m.id === hubMode);
+          const stat = mobilityHubSummaryRef.current?.perHubStats.find((s: { hubId: number }) => s.hubId === hub.id);
+          const hubMin = stat?.minMeters ?? (hubMode === "custom" ? mobilityHubMinMetersRef.current : (modeDef?.minMeters ?? 400));
+          const hubMax = stat?.maxMeters ?? (hubMode === "custom" ? mobilityHubMaxMetersRef.current : (modeDef?.maxMeters ?? 1500));
+          setPopup({
+            title: `モビリティ・ハブ検討候補地 H${hub.id}`,
+            lines: [
+              `名称: ${hub.name}`,
+              `所在地: ${hub.address}`,
+              <span key="note" style={{ color: "#fcd34d", fontSize: 11 }}>
+                ※藤沢市実証検討段階の候補地（未確定）
+              </span>,
+              `設定モード: ${modeDef?.label ?? "自由設定"}（${hubMin}m〜${hubMax >= 1000 ? `${hubMax / 1000}km` : `${hubMax}m`}）`,
+              ...(stat
+                ? [
+                    <span key="stat" style={{ color: "#fbbf24", fontWeight: "bold" }}>
+                      単独救済建物: {stat.coveredBuildings}棟
+                    </span>,
+                  ]
+                : []),
+              `座標: 北緯${hub.lat.toFixed(6)}, 東経${hub.lng.toFixed(6)}`,
+            ],
+          });
+        } else if (picked instanceof Cesium.Cesium3DTileFeature) {
+          const info = featureScoreMap.get(picked);
+          if (info) {
+            const requestId = popupRequestRef.current;
+            const hubImp = info.mobilityHubImprovement;
+            const imp = info.customStopImprovement;
+            const statusNode: ReactNode = hubImp ? (
+              <span key="status" style={{ color: "#f59e0b", fontWeight: "bold" }}>
+                判定: モビリティ・ハブ救済（H{hubImp.hubId} {hubImp.hubName} の{hubImp.modeLabel}圏内）
+              </span>
+            ) : imp?.isNewlyCovered ? (
+              <span key="status" style={{ color: "#38bdf8", fontWeight: "bold" }}>
+                判定: 新規カバー（{imp.stopLabel} により空白地解消）
+              </span>
+            ) : (
+              `判定: ${info.isCovered ? "カバーされている" : "交通空白地"}`
+            );
+            const buildBuildingPopupLines = (routeComparisonNode?: ReactNode): ReactNode[] => [
+              statusNode,
+              ...(routeComparisonNode ? [routeComparisonNode] : []),
+              ...(hubImp
+                ? [
+                    <span key="hubImp" style={{ color: "#fbbf24" }}>
+                      最寄りハブ: H{hubImp.hubId} {hubImp.hubName}（直線距離 約
+                      {Math.round(hubImp.hubDistanceMeters)}m・{hubImp.modeLabel}）
+                    </span>,
+                  ]
+                : []),
+              ...(imp
+                ? [
+                    <span key="customStop" style={{ color: "#7dd3fc" }}>
+                      最寄り仮設停留所: {imp.stopLabel}（実効距離 約
+                      {Math.round(imp.afterBusEffectiveDistanceMeters)}m・徒歩
+                      {Math.round(imp.afterBusWalkMinutes)}分）
+                    </span>,
+                  ]
+                : []),
+              `既存最寄りバス停: ${info.nearestStopName}（実効距離 約${Math.round(info.busEffectiveDistanceMeters)}m・徒歩${Math.round(info.busWalkMinutes)}分）`,
+              `最寄り鉄道駅: ${info.nearestStationName}（実効距離 約${Math.round(info.stationEffectiveDistanceMeters)}m・徒歩${Math.round(info.stationWalkMinutes)}分）`,
+              ...(info.totalFloorArea != null ? [`延床面積: 約${Math.round(info.totalFloorArea)}m²`] : []),
+              `プロファイル: ${info.walkProfileLabel}`,
+            ];
+
+            setPopup({
+              title: info.usage,
+              lines: buildBuildingPopupLines(),
+            });
+
+            if (distanceModelRef.current === "network") {
+              const buildingId =
+                (picked.getProperty("uro:BuildingIDAttribute_uro:buildingID") as string | undefined) ??
+                `${info.lng},${info.lat}`;
+              const row = networkScoreMap?.get(buildingId);
+              const assignedCustomStop = imp ? customStops.find((s) => s.id === imp.stopId) : undefined;
+              let targetStopCoords: { lat: number; lng: number } | null = assignedCustomStop
+                ? { lat: assignedCustomStop.lat, lng: assignedCustomStop.lng }
+                : null;
+              if (!targetStopCoords) {
+                let bestStopDist = Infinity;
+                for (const s of majorOperatorStopList) {
+                  if (s.name !== info.nearestStopName) continue;
+                  const d = haversineMeters(info.lat, info.lng, s.lat, s.lng);
+                  if (d < bestStopDist) {
+                    bestStopDist = d;
+                    targetStopCoords = { lat: s.lat, lng: s.lng };
+                  }
+                }
+              }
+
+              if (row && targetStopCoords) {
+                const targetCoords = targetStopCoords;
+                void (async () => {
+                  const graph = await ensureRoutingGraph();
+                  if (cancelled || requestId !== popupRequestRef.current || !graph) return;
+                  const profile = walkProfileRef.current;
+                  if (!cachedRouteInspectRouter || cachedRouteInspectRouter.profile !== profile) {
+                    cachedRouteInspectRouter = { profile, router: new NetworkRouter(graph, profile) };
+                  }
+                  const route = cachedRouteInspectRouter.router.findPathFromNode(
+                    row.networkNode,
+                    targetCoords.lat,
+                    targetCoords.lng
+                  );
+                  if (!route || cancelled || requestId !== popupRequestRef.current) return;
+
+                  clearRouteComparisonEntities();
+                  const straightLine = viewer.entities.add({
+                    polyline: {
+                      positions: Cesium.Cartesian3.fromDegreesArray([
+                        info.lng,
+                        info.lat,
+                        targetCoords.lng,
+                        targetCoords.lat,
+                      ]),
+                      width: 3,
+                      material: new Cesium.PolylineDashMaterialProperty({
+                        color: Cesium.Color.fromCssColorString("#f8fafc").withAlpha(0.92),
+                        dashLength: 14,
+                      }),
+                      clampToGround: true,
+                      classificationType: Cesium.ClassificationType.TERRAIN,
+                    },
+                  });
+                  const roadPositions = Cesium.Cartesian3.fromDegreesArray(
+                    route.path.flatMap((pt) => [pt.lng, pt.lat])
+                  );
+                  const roadLine = viewer.entities.add({
+                    polyline: {
+                      positions: roadPositions,
+                      width: 6,
+                      material: new Cesium.PolylineOutlineMaterialProperty({
+                        color: Cesium.Color.fromCssColorString("#22d3ee"),
+                        outlineColor: Cesium.Color.fromCssColorString("#0f172a"),
+                        outlineWidth: 2,
+                      }),
+                      clampToGround: true,
+                      classificationType: Cesium.ClassificationType.TERRAIN,
+                    },
+                  });
+                  routeComparisonEntities = [straightLine, roadLine];
+                  viewer.scene.requestRender();
+
+                  const detourRatio = route.networkMeters / Math.max(route.straightMeters, 1);
+                  setPopup({
+                    title: info.usage,
+                    lines: buildBuildingPopupLines(
+                      <div
+                        key="routeCompare"
+                        style={{
+                          margin: "4px 0",
+                          padding: "5px 7px",
+                          borderRadius: 4,
+                          background: "rgba(34, 211, 238, 0.14)",
+                          border: "1px solid rgba(34, 211, 238, 0.4)",
+                          fontSize: 11.5,
+                          lineHeight: 1.45,
+                        }}
+                      >
+                        <div style={{ color: "#67e8f9", fontWeight: "bold" }}>
+                          直線 約{Math.round(route.straightMeters)}m → 道のり 約
+                          {Math.round(route.networkMeters)}m（迂回率 {detourRatio.toFixed(2)}倍）
+                        </div>
+                        <div style={{ fontSize: 10.5, color: "#cbd5e1", marginTop: 1 }}>
+                          <span style={{ color: "#22d3ee" }}>━</span> 実際の歩行ルート ／{" "}
+                          <span style={{ color: "#f8fafc" }}>┄</span> 直線距離
+                        </div>
+                      </div>
+                    ),
+                  });
+                })();
+              }
+            }
+          } else {
+            setPopup(null);
+          }
+        } else {
+          setPopup(null);
+        }
+      }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+      // 起動時およびリセット時のカメラ視点を設定（BoundingSphereで中心点と半径を合わせる）。
+      function flyToInitialView(duration = 0) {
+        const center = Cesium.Cartesian3.fromDegrees(
+          INITIAL_VIEW_CENTER_LNG,
+          INITIAL_VIEW_CENTER_LAT
+        );
+        const sphere = new Cesium.BoundingSphere(center, INITIAL_VIEW_RADIUS_METERS);
+        viewer.camera.flyToBoundingSphere(sphere, {
+          offset: new Cesium.HeadingPitchRange(
+            Cesium.Math.toRadians(INITIAL_VIEW_HEADING),
+            Cesium.Math.toRadians(INITIAL_VIEW_PITCH)
+          ),
+          duration,
+        });
+      }
+
+      flyToInitialViewRef.current = flyToInitialView;
+      flyToInitialView(0);
+    }
+
+    init();
+
+    return () => {
+      cancelled = true;
+      disposeRuntime();
+      scheduleDemandTransitRecomputeRef.current = null;
+      scheduleDemandTransitAnalysisRef.current = null;
+      applyWalkProfileRef.current = null;
+      applyDistanceModelRef.current = null;
+      applyNetworkThresholdMultiplierRef.current = null;
+      removeCustomStopRef.current = null;
+      undoLastCustomStopRef.current = null;
+      clearCustomStopsRef.current = null;
+      flyToCustomStopRef.current = null;
+      reapplyCustomStopScoresRef.current = null;
+      exportCustomStopSimulationGeoJsonRef.current = null;
+      warmUpRoutingGraphRef.current = null;
+      clearRouteComparisonRef.current = null;
+      if (roadSnapNoticeTimerRef.current) {
+        clearTimeout(roadSnapNoticeTimerRef.current);
+        roadSnapNoticeTimerRef.current = null;
+      }
+      reapplyMobilityHubScoresRef.current = null;
+      flyToMobilityHubRef.current = null;
+      exportMobilityHubGeoJsonRef.current = null;
+      flyToInitialViewRef.current = null;
+      helloCyclingEntitiesRef.current = [];
+      viewerRef.current?.destroy();
+      viewerRef.current = null;
+    };
+  }, []);
+
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      <div
+        ref={containerRef}
+        style={{
+          width: "100%",
+          height: "100%",
+          cursor: isAddingCustomStop ? "crosshair" : "default",
+        }}
+      />
+      <Legend
+        clusterCount={demandTransitClusterCount}
+        analysisThresholdMultiplier={demandTransitAnalysisThresholdMultiplier}
+        showHelloCycling={showHelloCycling}
+        walkProfile={walkProfile}
+        distanceModel={distanceModel}
+        loadingNetworkScores={loadingNetworkScores}
+        networkThresholdMultiplier={networkThresholdMultiplier}
+        showExperimentalDistanceModel={showExperimentalDistanceModel}
+        onClusterCountChange={(value) => {
+          demandTransitClusterCountRef.current = value;
+          setDemandTransitClusterCount(value);
+          scheduleDemandTransitRecomputeRef.current?.();
+        }}
+        onAnalysisThresholdMultiplierChange={(value) => {
+          // ドラッグ中の細かな変化はinit側でまとめ、操作が止まった条件だけを再計算する。
+          // 既存のグラフはローディング表示の下に残し、完了時に新条件の結果へ差し替える。
+          // 自由配置した仮設停留所の水色カバー判定には即座に反映する。
+          demandTransitAnalysisThresholdMultiplierRef.current = value;
+          setDemandTransitAnalysisThresholdMultiplier(value);
+          reapplyCustomStopScoresRef.current?.();
+          if (demandTransitPlanAnalysis || isDemandTransitPanelVisible) {
+            scheduleDemandTransitAnalysisRef.current?.();
+          }
+        }}
+        onShowHelloCyclingChange={setShowHelloCycling}
+        onWalkProfileChange={(value) => {
+          setWalkProfile(value);
+          setCenterLoading({
+            title: `${WALK_PROFILES[value].label}を反映中…`,
+            subtitle: "建物の坂道負荷・歩行速度を再計算しています",
+          });
+          applyWalkProfileRef.current?.(value);
+        }}
+        onDistanceModelChange={(value) => {
+          setDistanceModel(value);
+          setCenterLoading({
+            title: value === "network" ? "道路網距離を反映中…" : "直線距離モデルを反映中…",
+            subtitle: "建物の距離基準を切り替えています",
+          });
+          applyDistanceModelRef.current?.(value);
+        }}
+        onNetworkThresholdMultiplierChange={(value) => {
+          setNetworkThresholdMultiplier(value);
+          applyNetworkThresholdMultiplierRef.current?.(value);
+          reapplyCustomStopScoresRef.current?.();
+        }}
+        onToggleExperimentalDistanceModel={setShowExperimentalDistanceModel}
+        isDemandTransitAnalysisRunning={isDemandTransitAnalysisRunning}
+        isDemandTransitPanelVisible={isDemandTransitPanelVisible}
+        onShowDemandTransitPanel={() => {
+          setIsDemandTransitPanelVisible(true);
+          if (!demandTransitPlanAnalysis && !isDemandTransitAnalysisRunning) {
+            scheduleDemandTransitAnalysisRef.current?.(0);
+          }
+        }}
+        isAddingCustomStop={isAddingCustomStop}
+        customStopCount={customStopSummary?.stopCount ?? 0}
+        customStopNewlyCoveredCount={customStopSummary?.newlyCoveredBuildings ?? 0}
+        isMobilityHubActive={isMobilityHubActive}
+        onToggleMobilityHubActive={handleToggleMobilityHubActive}
+        mobilityHubRescuedCount={mobilityHubSummary?.newlyCoveredBuildings}
+        mobilityHubRescuedArea={mobilityHubSummary?.newlyCoveredFloorArea}
+        isCollapsed={isLegendCollapsed}
+        onToggleCollapsed={() => setIsLegendCollapsed((prev) => !prev)}
+        onToggleAddingCustomStop={handleToggleAddingCustomStop}
+        onClearCustomStops={() => {
+          setIsAddingCustomStop(false);
+          clearCustomStopsRef.current?.();
+          setIsLegendCollapsed(false);
+        }}
+      />
+      <CustomStopSimulationPanel
+        isVisible={isAddingCustomStop || (customStopSummary?.stopCount ?? 0) > 0}
+        isAddingCustomStop={isAddingCustomStop}
+        isEvaluating={isEvaluatingCustomStops}
+        summary={customStopSummary}
+        analysisThresholdMultiplier={
+          distanceModel === "network" ? networkThresholdMultiplier : demandTransitAnalysisThresholdMultiplier
+        }
+        onToggleAddingCustomStop={handleToggleAddingCustomStop}
+        onClearStops={() => {
+          setIsAddingCustomStop(true);
+          clearCustomStopsRef.current?.();
+          setIsLegendCollapsed(true);
+        }}
+        onRemoveStop={(id) => removeCustomStopRef.current?.(id)}
+        onFlyToStop={(id) => flyToCustomStopRef.current?.(id)}
+        onExportGeoJson={() => exportCustomStopSimulationGeoJsonRef.current?.()}
+        onClose={() => {
+          setIsAddingCustomStop(false);
+          clearCustomStopsRef.current?.();
+          setIsLegendCollapsed(false);
+        }}
+      />
+      <MobilityHubSimulationPanel
+        isVisible={isMobilityHubActive}
+        selectedMode={mobilityHubMode}
+        minMeters={mobilityHubMinMeters}
+        maxMeters={mobilityHubMaxMeters}
+        activeHubIds={activeMobilityHubIds}
+        hubModes={hubModes}
+        summary={mobilityHubSummary}
+        onSelectMode={handleSelectMobilityHubMode}
+        onChangeMinMeters={handleChangeMobilityHubMinMeters}
+        onChangeMaxMeters={handleChangeMobilityHubMaxMeters}
+        onToggleHub={handleToggleMobilityHub}
+        onUpdateHubMode={handleUpdateHubMode}
+        onFlyToHub={(id) => flyToMobilityHubRef.current?.(id)}
+        onExportGeoJson={() => exportMobilityHubGeoJsonRef.current?.()}
+        onClose={handleCloseMobilityHub}
+      />
+      {analysisError && <div role="alert" style={{position:'absolute',right:12,top:12,zIndex:20,maxWidth:360,padding:12,background:'#7f1d1d',color:'white'}}>{analysisError}<button onClick={()=>setAnalysisError(null)} aria-label="通知を閉じる">×</button></div>}
+      {roadSnapNotice && (
+        <div
+          role="status"
+          style={
+            roadSnapNotice.isError
+              ? {
+                  position: "absolute",
+                  top: "50%",
+                  left: "50%",
+                  transform: "translate(-50%, -50%)",
+                  zIndex: 200,
+                  padding: "14px 22px",
+                  background: "rgba(185, 28, 28, 0.94)",
+                  color: "#ffffff",
+                  fontSize: 14,
+                  fontWeight: "bold",
+                  borderRadius: 8,
+                  boxShadow: "0 8px 32px rgba(0, 0, 0, 0.5)",
+                  border: "1px solid rgba(255, 255, 255, 0.2)",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  backdropFilter: "blur(8px)",
+                  pointerEvents: "none",
+                  whiteSpace: "nowrap",
+                }
+              : {
+                  position: "absolute",
+                  top: 16,
+                  left: "50%",
+                  transform: "translateX(-50%)",
+                  zIndex: 100,
+                  padding: "8px 18px",
+                  background: "rgba(14, 116, 144, 0.94)",
+                  color: "#ffffff",
+                  fontSize: 13,
+                  fontWeight: "bold",
+                  borderRadius: 6,
+                  boxShadow: "0 4px 16px rgba(0, 0, 0, 0.4)",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  backdropFilter: "blur(6px)",
+                  pointerEvents: "none",
+                  whiteSpace: "nowrap",
+                }
+          }
+        >
+          <span>{roadSnapNotice.isError ? "⚠️" : roadSnapNotice.isPending ? "⏳" : "📍"}</span>
+          <span>{roadSnapNotice.message}</span>
+        </div>
+      )}
+      <UncoloredBuildingsNote />
+      <DemandTransitRecommendationPanel
+        analysis={demandTransitPlanAnalysis}
+        selectedCount={demandTransitClusterCount}
+        isRunning={isDemandTransitAnalysisRunning}
+        pendingThresholdMultiplier={demandTransitAnalysisThresholdMultiplier}
+        isVisible={isDemandTransitPanelVisible}
+        onClose={() => setIsDemandTransitPanelVisible(false)}
+      />
+      {!isSimulationPanelVisible && popup && <InfoPopup info={popup} onClose={() => { ++popupRequestRef.current; candidatePopupRef.current = false; clearRouteComparisonRef.current?.(); setPopup(null); }} />}
+      <CenterLoadingIndicator loadingState={centerLoading} />
+    </div>
+  );
+}
