@@ -8,6 +8,13 @@ import {
   unprojectFromLocalMeters,
   kMeans,
   BUILDING_NETWORK_SCORES_JSON_URL,
+  BUS_STOP_FREQUENCIES_JSON_URL,
+  BUILDING_STOP_CANDIDATES_JSON_URL,
+  FREQUENCY_TIME_BAND_LABELS,
+  FREQUENCY_EVAL_MODE_LABELS,
+  getStopFrequencyPerHour,
+  evaluateStopWithFrequency,
+  pickBestCandidateStopWithFrequency,
   evaluateCustomStopsSimulation,
   buildCustomStopSimulationGeoJson,
   MOBILITY_HUB_CANDIDATES,
@@ -16,6 +23,12 @@ import {
   buildMobilityHubSimulationGeoJson,
   type WalkProfile,
   type DistanceModel,
+  type FrequencyTimeBand,
+  type FrequencyEvalMode,
+  type BusStopFrequencyItem,
+  type BusStopFrequenciesDataset,
+  type BuildingStopCandidatesDataset,
+  type FrequencyEvalOptions,
   type BuildingNetworkScoreRow,
   type DemandTransitPlanAnalysis,
   type DemandTransitMember,
@@ -36,6 +49,7 @@ import { NetworkRouter, type RoutingGraph } from "./lib/network-routing";
 import { TileWorkGate } from "./lib/async-generation";
 import type { AnalysisResponse } from "./workers/transit-analysis.worker";
 import { SlopeCalculationModal } from "./SlopeCalculationModal";
+import { DataAttributionModal } from "./DataAttributionModal";
 import { useEffect, useRef, useState, useCallback, type ReactNode } from "react";
 import * as Cesium from "cesium";
 
@@ -80,6 +94,9 @@ const BUS_STOP_PIXEL_SIZE = 10;
 // 「同じ系統だがその他事業者」と分かるようにしている。
 const BUS_STOP_COLOR_MINOR = Cesium.Color.fromCssColorString("#fde68a");
 const BUS_STOP_PIXEL_SIZE_MINOR = BUS_STOP_PIXEL_SIZE;
+const BUS_STOP_COLOR_FREQ_MEDIUM = Cesium.Color.fromCssColorString("#fbbf24");
+const BUS_STOP_COLOR_FREQ_LOW = Cesium.Color.fromCssColorString("#fed7aa");
+const BUS_STOP_COLOR_FREQ_EXCLUDED = Cesium.Color.fromCssColorString("#64748b");
 
 // 起動時の初期カメラ表示範囲（ユーザー指定の中心点・半径・角度）。
 const INITIAL_VIEW_CENTER_LNG = 139.44893;
@@ -98,7 +115,7 @@ function isMajorOperatorStop(stop: BusStop): boolean {
 }
 
 type BusRoute = { name: string; classCode: string | null };
-type BusStop = { name: string; lat: number; lng: number; operator: string; routes: BusRoute[] };
+type BusStop = { name: string; lat: number; lng: number; operator: string; routes: BusRoute[]; freqItem?: BusStopFrequencyItem | null };
 
 // 分析用施設はanalysis-facilities.json。市境・東海道線で利用先を切らない。
 type TrainStation = { name: string; lat: number; lng: number };
@@ -212,6 +229,13 @@ type BuildingScoreInfo = {
   lat: number;
   lng: number;
   nearestStopName: string;
+  nearestStopLat?: number;
+  nearestStopLng?: number;
+  nearestStopOperator?: string;
+  nearestStopPerHour?: number | null;
+  nearestStopWaitPenaltyMeters?: number;
+  nearestStopIsPositionOnlyFallback?: boolean;
+  frequencyConditionLabel?: string;
   busStraightDistanceMeters: number;
   busEffectiveDistanceMeters: number;
   busWalkMinutes: number;
@@ -633,6 +657,11 @@ function Legend({
   loadingNetworkScores,
   networkThresholdMultiplier,
   showExperimentalDistanceModel,
+  frequencyMode,
+  frequencyTimeBand,
+  frequencyMinPerHour,
+  includeUnlistedBusOperators,
+  odptFrequencyLoaded,
   onClusterCountChange,
   onAnalysisThresholdMultiplierChange,
   onShowHelloCyclingChange,
@@ -640,6 +669,10 @@ function Legend({
   onDistanceModelChange,
   onNetworkThresholdMultiplierChange,
   onToggleExperimentalDistanceModel,
+  onFrequencyModeChange,
+  onFrequencyTimeBandChange,
+  onFrequencyMinPerHourChange,
+  onIncludeUnlistedBusOperatorsChange,
   isDemandTransitAnalysisRunning,
   isDemandTransitPanelVisible,
   onShowDemandTransitPanel,
@@ -663,6 +696,11 @@ function Legend({
   loadingNetworkScores: boolean;
   networkThresholdMultiplier: number;
   showExperimentalDistanceModel: boolean;
+  frequencyMode: FrequencyEvalMode;
+  frequencyTimeBand: FrequencyTimeBand;
+  frequencyMinPerHour: number;
+  includeUnlistedBusOperators: boolean;
+  odptFrequencyLoaded: boolean;
   onClusterCountChange: (value: number) => void;
   onAnalysisThresholdMultiplierChange: (value: number) => void;
   onShowHelloCyclingChange: (value: boolean) => void;
@@ -670,6 +708,10 @@ function Legend({
   onDistanceModelChange: (value: DistanceModel) => void;
   onNetworkThresholdMultiplierChange: (value: number) => void;
   onToggleExperimentalDistanceModel: (value: boolean) => void;
+  onFrequencyModeChange: (value: FrequencyEvalMode) => void;
+  onFrequencyTimeBandChange: (value: FrequencyTimeBand) => void;
+  onFrequencyMinPerHourChange: (value: number) => void;
+  onIncludeUnlistedBusOperatorsChange: (value: boolean) => void;
   isDemandTransitAnalysisRunning: boolean;
   isDemandTransitPanelVisible: boolean;
   onShowDemandTransitPanel: () => void;
@@ -762,7 +804,7 @@ function Legend({
       {!isCollapsed && (
         <>
           <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 4 }}>
-            バス停400m／鉄道駅800mを参考に、地形勾配と歩行負荷の補正を加えて判定しています（市の公式判定そのものではありません）。交通施設は市境・東海道線の外側も含む周辺矩形から抽出。駅は代表点を使用し、運行頻度は考慮していません。
+            バス停400m／鉄道駅800mを参考に、地形勾配・歩行負荷・ODPT運行頻度を加えて判定しています（市の公式判定そのものではありません）。交通施設は市境・東海道線の外側も含む周辺矩形から抽出。駅は代表点を使用。
           </div>
       {COVERAGE_RANKS.map((rank) => (
         <div key={rank.legendLabel} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
@@ -939,6 +981,121 @@ function Legend({
           </>
         )}
       </div>
+      <div
+        style={{
+          marginTop: 7,
+          padding: "6px 7px",
+          background: "rgba(56, 189, 248, 0.08)",
+          border: "1px solid rgba(56, 189, 248, 0.28)",
+          borderRadius: 5,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 3 }}>
+          <span style={{ color: "#7dd3fc", fontWeight: "bold", fontSize: 11.5 }}>
+            運行頻度・時間帯（ODPT時刻表）
+          </span>
+          <span style={{ fontSize: 10, color: odptFrequencyLoaded ? "#86efac" : "#fde68a" }}>
+            {odptFrequencyLoaded ? "平日ダイヤ読込済" : "読込中…"}
+          </span>
+        </div>
+        {(["none", "threshold", "waitPenalty"] as FrequencyEvalMode[]).map((modeKey) => (
+          <label key={modeKey} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+            <input
+              type="radio"
+              name="frequencyMode"
+              checked={frequencyMode === modeKey}
+              disabled={!odptFrequencyLoaded && modeKey !== "none"}
+              onChange={() => onFrequencyModeChange(modeKey)}
+            />
+            <span>{FREQUENCY_EVAL_MODE_LABELS[modeKey]}</span>
+          </label>
+        ))}
+        {frequencyMode !== "none" && (
+          <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(255,255,255,0.18)" }}>
+            <div style={{ fontSize: 11, color: "#ffffff", marginBottom: 3 }}>評価時間帯（平日）:</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+              {(["allDay", "morning", "daytime", "evening"] as FrequencyTimeBand[]).map((bandKey) => {
+                const band = FREQUENCY_TIME_BAND_LABELS[bandKey];
+                const active = frequencyTimeBand === bandKey;
+                return (
+                  <button
+                    key={bandKey}
+                    type="button"
+                    onClick={() => onFrequencyTimeBandChange(bandKey)}
+                    style={{
+                      padding: "3px 5px",
+                      borderRadius: 4,
+                      fontSize: 11,
+                      cursor: "pointer",
+                      border: active ? "1px solid #38bdf8" : "1px solid rgba(255,255,255,0.28)",
+                      background: active ? "rgba(56, 189, 248, 0.28)" : "rgba(255,255,255,0.08)",
+                      color: active ? "#e0f2fe" : "#ffffff",
+                      fontWeight: active ? "bold" : "normal",
+                      textAlign: "left",
+                    }}
+                  >
+                    {band.shortLabel} ({band.rangeLabel})
+                  </button>
+                );
+              })}
+            </div>
+            {frequencyMode === "threshold" && (
+              <div style={{ marginTop: 6 }}>
+                <div style={{ fontSize: 11, color: "#ffffff", marginBottom: 3 }}>最低本数（1時間あたり）:</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4 }}>
+                  {[1, 2, 3, 4].map((n) => {
+                    const active = frequencyMinPerHour === n;
+                    return (
+                      <button
+                        key={n}
+                        type="button"
+                        onClick={() => onFrequencyMinPerHourChange(n)}
+                        style={{
+                          padding: "3px 2px",
+                          borderRadius: 4,
+                          fontSize: 11,
+                          cursor: "pointer",
+                          border: active ? "1px solid #38bdf8" : "1px solid rgba(255,255,255,0.28)",
+                          background: active ? "rgba(56, 189, 248, 0.28)" : "rgba(255,255,255,0.08)",
+                          color: active ? "#e0f2fe" : "#ffffff",
+                          fontWeight: active ? "bold" : "normal",
+                        }}
+                      >
+                        {n}本+
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {frequencyMode === "waitPenalty" && (
+              <div style={{ fontSize: 10.5, color: "#f8fafc", marginTop: 5, lineHeight: 1.4 }}>
+                毎時4本以上（15分間隔以内）を0mとし、減便時は平均待ち時間差の25%を実効歩行距離へ加算します（上限400m／0本時間帯は除外）。
+              </div>
+            )}
+            <label
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 6,
+                cursor: "pointer",
+                marginTop: 6,
+                fontSize: 11,
+                lineHeight: 1.35,
+                color: "#ffffff",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={includeUnlistedBusOperators}
+                onChange={(e) => onIncludeUnlistedBusOperatorsChange(e.target.checked)}
+                style={{ marginTop: 2 }}
+              />
+              <span>江ノ電バスも位置基準で対象に含める（ODPT時刻表未公開のため頻度不問）</span>
+            </label>
+          </div>
+        )}
+      </div>
       <div style={{ borderTop: "1px solid rgba(255,255,255,0.3)", margin: "8px 0 6px" }} />
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
         <span
@@ -968,6 +1125,11 @@ function Legend({
         />
         <span>バス停（その他事業者・コミュニティバス。参考表示のみ）</span>
       </div>
+      {frequencyMode !== "none" && (
+        <div style={{ fontSize: 10.5, color: "#f8fafc", marginTop: 4, lineHeight: 1.4 }}>
+          運行頻度反映時: 濃い橙(大)=毎時4本以上 ／ 淡橙(中〜小)=4本未満 ／ 灰(小)=条件未満・運休時間帯
+        </div>
+      )}
       {SHOW_AUTO_CANDIDATE_AND_COMPARISON_UI && (
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
           <span
@@ -2009,29 +2171,43 @@ function MobilityHubSimulationPanel({
   );
 }
 
-// 「なぜ白いままの建物が多いのか」の説明。左上のLegendは既に縦に長いため、
-// 空いている右下に別枠で表示する（右上はInfoPopupが使う）。
-function UncoloredBuildingsNote() {
+// 地図領域を広く保つため、右下の出典・未着色建物の説明はコンパクトなボタンに集約し、
+// クリック時に DataAttributionModal を開いて詳細を表示する。
+function DataAttributionButton({ onClick }: { onClick: () => void }) {
+  const [hovered, setHovered] = useState(false);
   return (
-    <div
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      title="ODPT・PLATEAUのデータ出典と未着色建物の注記を見る"
       style={{
         position: "absolute",
         right: 12,
-        bottom: 12,
+        bottom: 16,
         zIndex: 10,
-        background: "rgba(20, 20, 20, 0.75)",
-        color: "#fff",
-        padding: "8px 10px",
+        background: hovered ? "rgba(56, 189, 248, 0.3)" : "rgba(15, 23, 42, 0.84)",
+        border: "1px solid rgba(56, 189, 248, 0.45)",
+        color: "#38bdf8",
         borderRadius: 6,
-        fontSize: 11,
-        lineHeight: 1.5,
+        fontSize: 12,
+        padding: "5px 10px",
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        gap: 5,
+        lineHeight: 1.3,
         fontFamily: "sans-serif",
-        maxWidth: 260,
-        pointerEvents: "none",
+        boxShadow: "0 4px 12px rgba(0, 0, 0, 0.4)",
+        backdropFilter: "blur(6px)",
+        transition: "all 0.15s ease",
+        pointerEvents: "auto",
       }}
     >
-      白い建物は住宅系以外・用途不明・未評価です。読み込み中、通信失敗、道路網データ未収録の場合も白く表示されます。
-    </div>
+      <span style={{ fontSize: 12 }}>ℹ️</span>
+      <span>データ出典・注記</span>
+    </button>
   );
 }
 
@@ -2393,6 +2569,13 @@ export default function PlateauViewer() {
   // 全建物ぶん無効化され、読み込み済みの建物すべてを新しいプロファイルで再計算する（詳細は
   // applyWalkProfileのコメント参照）。
   const [walkProfile, setWalkProfile] = useState<WalkProfile>(WALK_PROFILE_DEFAULT);
+  // ODPTチャレンジ2026連携: 運行頻度・時間帯の評価設定（既定は"none"で位置基準と一致）。
+  const [frequencyMode, setFrequencyMode] = useState<FrequencyEvalMode>("none");
+  const [frequencyTimeBand, setFrequencyTimeBand] = useState<FrequencyTimeBand>("daytime");
+  const [frequencyMinPerHour, setFrequencyMinPerHour] = useState<number>(1);
+  const [includeUnlistedBusOperators, setIncludeUnlistedBusOperators] = useState<boolean>(true);
+  const [odptFrequencyLoaded, setOdptFrequencyLoaded] = useState<boolean>(false);
+  const [showDataAttributionModal, setShowDataAttributionModal] = useState<boolean>(false);
   // 【実験的】直線距離モデル/道路網距離モデルの切り替え（詳細はDistanceModelのコメント参照）。
   const [distanceModel, setDistanceModel] = useState<DistanceModel>(DISTANCE_MODEL_DEFAULT);
   // "network"に初めて切り替えたときに大容量JSONを遅延読み込みする。読み込み中はtrueにして
@@ -2443,6 +2626,10 @@ export default function PlateauViewer() {
   const demandTransitClusterCountRef = useRef(demandTransitClusterCount);
   const demandTransitAnalysisThresholdMultiplierRef = useRef(demandTransitAnalysisThresholdMultiplier);
   const walkProfileRef = useRef(walkProfile);
+  const frequencyModeRef = useRef<FrequencyEvalMode>(frequencyMode);
+  const frequencyTimeBandRef = useRef<FrequencyTimeBand>(frequencyTimeBand);
+  const frequencyMinPerHourRef = useRef<number>(frequencyMinPerHour);
+  const includeUnlistedBusOperatorsRef = useRef<boolean>(includeUnlistedBusOperators);
   const distanceModelRef = useRef(distanceModel);
   const networkThresholdMultiplierRef = useRef(networkThresholdMultiplier);
   const isAddingCustomStopRef = useRef(isAddingCustomStop);
@@ -2462,6 +2649,10 @@ export default function PlateauViewer() {
     demandTransitClusterCountRef.current = demandTransitClusterCount;
     demandTransitAnalysisThresholdMultiplierRef.current = demandTransitAnalysisThresholdMultiplier;
     walkProfileRef.current = walkProfile;
+    frequencyModeRef.current = frequencyMode;
+    frequencyTimeBandRef.current = frequencyTimeBand;
+    frequencyMinPerHourRef.current = frequencyMinPerHour;
+    includeUnlistedBusOperatorsRef.current = includeUnlistedBusOperators;
     distanceModelRef.current = distanceModel;
     networkThresholdMultiplierRef.current = networkThresholdMultiplier;
     showHelloCyclingRef.current = showHelloCycling;
@@ -2477,6 +2668,10 @@ export default function PlateauViewer() {
     demandTransitClusterCount,
     demandTransitAnalysisThresholdMultiplier,
     walkProfile,
+    frequencyMode,
+    frequencyTimeBand,
+    frequencyMinPerHour,
+    includeUnlistedBusOperators,
     distanceModel,
     networkThresholdMultiplier,
     showHelloCycling,
@@ -2504,6 +2699,7 @@ export default function PlateauViewer() {
   // 【実験的】道路網距離モデルの閾値倍率スライダーのonChangeから呼べるようにするための橋渡し
   // （applyWalkProfileRefと同じ理由。同期的にrefを書き換えてからキャッシュを無効化する）。
   const applyNetworkThresholdMultiplierRef = useRef<((multiplier: number) => void) | null>(null);
+  const applyFrequencySettingsRef = useRef<(() => void) | null>(null);
   // 自由配置した仮設停留所の操作用ref。
   const removeCustomStopRef = useRef<((id: number) => void) | null>(null);
   const undoLastCustomStopRef = useRef<(() => void) | null>(null);
@@ -2698,6 +2894,10 @@ export default function PlateauViewer() {
         selectionIndicator: false,
       });
       viewerRef.current = viewer;
+      // 画面最下部のCesiumクレジット欄にもODPTの出典を常時表示する。
+      viewer.creditDisplay.addStaticCredit(
+        new Cesium.Credit("公共交通オープンデータセンター（ODPT）・神奈川中央交通", true)
+      );
 
       // 航空写真の上にOpenStreetMapの道路網を半透明（40%）でオーバーレイ。
       // これにより、元の落ち着いた美しいダークトーンと3D建物の水色発光を維持したまま、
@@ -2735,6 +2935,40 @@ export default function PlateauViewer() {
       // 分かるようにしておく。
       viewer.scene.globe.baseColor = Cesium.Color.DARKSLATEGRAY;
 
+      // ODPTチャレンジ2026 バス停運行頻度データを読み込む。
+      let freqStopsByIndex: BusStopFrequencyItem[] = [];
+      const freqByCoordKey = new Map<string, BusStopFrequencyItem>();
+      try {
+        const res = await fetch(BUS_STOP_FREQUENCIES_JSON_URL);
+        if (res.ok) {
+          const dataset: BusStopFrequenciesDataset = await res.json();
+          if (cancelled) return;
+          freqStopsByIndex = dataset.stops;
+          for (const item of dataset.stops) {
+            freqByCoordKey.set(`${item.lat.toFixed(6)},${item.lng.toFixed(6)}`, item);
+          }
+          setOdptFrequencyLoaded(true);
+        }
+      } catch (err) {
+        console.warn("ODPT運行頻度データの読み込みに失敗しました", err);
+      }
+
+      function findFreqItem(stop: { name: string; lat: number; lng: number }): BusStopFrequencyItem | null {
+        const exact = freqByCoordKey.get(`${stop.lat.toFixed(6)},${stop.lng.toFixed(6)}`);
+        if (exact) return exact;
+        let best: BusStopFrequencyItem | null = null;
+        let bestDist = 25;
+        for (const item of freqStopsByIndex) {
+          if (item.name !== stop.name) continue;
+          const d = haversineMeters(stop.lat, stop.lng, item.lat, item.lng);
+          if (d < bestDist) {
+            bestDist = d;
+            best = item;
+          }
+        }
+        return best;
+      }
+
       // バス停をピンで表示する。ラベルは付けず、クリックで名称をポップアップ表示する
       // （337件と数が多く、常時ラベル表示すると密集地でズームアウト時に重なりすぎるため）。
       // busStopList は自動フィット用に全件保持し、majorOperatorStopList は実効距離の
@@ -2742,20 +2976,81 @@ export default function PlateauViewer() {
       const busStopPositions: Cesium.Cartesian3[] = [];
       let busStopList: BusStop[] = [];
       let majorOperatorStopList: BusStop[] = [];
+      type BusStopPinRecord = { entity: Cesium.Entity; isMajor: boolean; freqItem: BusStopFrequencyItem | null };
+      const busStopPinRecords: BusStopPinRecord[] = [];
+      function updateBusStopPinAppearances() {
+        const mode = frequencyModeRef.current;
+        const timeBand = frequencyTimeBandRef.current;
+        const minPerHour = frequencyMinPerHourRef.current;
+        const includeUnlisted = includeUnlistedBusOperatorsRef.current;
+        for (const rec of busStopPinRecords) {
+          if (!rec.entity.point) continue;
+          if (!rec.isMajor) {
+            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_MINOR);
+            rec.entity.point.pixelSize = new Cesium.ConstantProperty(BUS_STOP_PIXEL_SIZE_MINOR);
+            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+            continue;
+          }
+          if (mode === "none") {
+            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
+            rec.entity.point.pixelSize = new Cesium.ConstantProperty(BUS_STOP_PIXEL_SIZE);
+            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+            continue;
+          }
+          const freq = rec.freqItem;
+          if (!freq || !freq.hasOdptTimetable) {
+            if (includeUnlisted) {
+              rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
+              rec.entity.point.pixelSize = new Cesium.ConstantProperty(9);
+              rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+            } else {
+              rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_FREQ_EXCLUDED);
+              rec.entity.point.pixelSize = new Cesium.ConstantProperty(6);
+              rec.entity.point.outlineWidth = new Cesium.ConstantProperty(0);
+            }
+            continue;
+          }
+          const perHour = getStopFrequencyPerHour(freq, timeBand) ?? 0;
+          if (perHour <= 0 || (mode === "threshold" && perHour < minPerHour)) {
+            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_FREQ_EXCLUDED);
+            rec.entity.point.pixelSize = new Cesium.ConstantProperty(6);
+            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(0);
+          } else if (perHour >= 4) {
+            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
+            rec.entity.point.pixelSize = new Cesium.ConstantProperty(12);
+            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(2);
+          } else if (perHour >= 1) {
+            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_FREQ_MEDIUM);
+            rec.entity.point.pixelSize = new Cesium.ConstantProperty(10);
+            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+          } else {
+            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_FREQ_LOW);
+            rec.entity.point.pixelSize = new Cesium.ConstantProperty(8);
+            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+          }
+        }
+        viewer.scene.requestRender();
+      }
       try {
         const res = await fetch(BUS_STOPS_JSON_URL);
         const data: { busStops: BusStop[] } = await res.json();
         if (cancelled) return;
-        busStopList = data.busStops;
+        busStopList = data.busStops.map((s) => ({ ...s, freqItem: findFreqItem(s) }));
         majorOperatorStopList = busStopList.filter(isMajorOperatorStop);
         for (const stop of busStopList) {
           const position = Cesium.Cartesian3.fromDegrees(stop.lng, stop.lat);
           busStopPositions.push(position);
           const isMajor = isMajorOperatorStop(stop);
-          viewer.entities.add({
+          const entity = viewer.entities.add({
             name: stop.name,
             position,
-            properties: { isBusStop: true, operator: stop.operator, routes: stop.routes, isMajorOperator: isMajor },
+            properties: {
+              isBusStop: true,
+              operator: stop.operator,
+              routes: stop.routes,
+              isMajorOperator: isMajor,
+              freqItem: stop.freqItem ?? null,
+            },
             point: {
               pixelSize: isMajor ? BUS_STOP_PIXEL_SIZE : BUS_STOP_PIXEL_SIZE_MINOR,
               color: isMajor ? BUS_STOP_COLOR : BUS_STOP_COLOR_MINOR,
@@ -2764,7 +3059,9 @@ export default function PlateauViewer() {
               heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
             },
           });
+          busStopPinRecords.push({ entity, isMajor, freqItem: stop.freqItem ?? null });
         }
+        updateBusStopPinAppearances();
       } catch (err) {
         console.error("バス停データの読み込みに失敗しました", err);
       }
@@ -2789,7 +3086,9 @@ export default function PlateauViewer() {
         const res = await fetch("/data/analysis-facilities.json");
         if (!res.ok) throw new Error("交通施設データの取得に失敗しました");
         const data: { stations: TrainStation[]; busStops: BusStop[] } = await res.json();
-        majorOperatorStopList = data.busStops.filter(isMajorOperatorStop);
+        majorOperatorStopList = data.busStops
+          .filter(isMajorOperatorStop)
+          .map((s) => ({ ...s, freqItem: findFreqItem(s) }));
         if (cancelled) return;
         trainStationList = data.stations;
       } catch (err) {
@@ -2966,6 +3265,7 @@ export default function PlateauViewer() {
       // 格納する。buildingIdをキーに直接引けるので、該当する建物は地形サンプリング不要で
       // 即座に色を決められる。
       let networkScoreMap: Map<string, BuildingNetworkScoreRow> | null = null;
+      let buildingStopCandidatesMap: Map<string, number[]> | null = null;
       let routingGraphCache: RoutingGraph | null = null;
       let routingGraphPromise: Promise<RoutingGraph | null> | null = null;
       let cachedRouteInspectRouter: { profile: WalkProfile; router: NetworkRouter } | null = null;
@@ -3729,11 +4029,24 @@ export default function PlateauViewer() {
         setLoadingNetworkScores(true);
         networkScoresPromise = (async () => {
           try {
-            const res = await fetch(BUILDING_NETWORK_SCORES_JSON_URL);
-            if (!res.ok) throw new Error(`network scores: ${res.status}`);
-            const rows: BuildingNetworkScoreRow[] = await res.json();
+            const [resScores, resCandidates] = await Promise.all([
+              fetch(BUILDING_NETWORK_SCORES_JSON_URL),
+              fetch(BUILDING_STOP_CANDIDATES_JSON_URL),
+            ]);
+            if (!resScores.ok) throw new Error(`network scores: ${resScores.status}`);
+            const rows: BuildingNetworkScoreRow[] = await resScores.json();
             if (cancelled) return null;
             networkScoreMap = new Map(rows.map(row => [row.buildingId, row]));
+            if (resCandidates.ok) {
+              const candData: BuildingStopCandidatesDataset = await resCandidates.json();
+              if (!cancelled && candData.rows.length === rows.length) {
+                const candMap = new Map<string, number[]>();
+                for (let i = 0; i < rows.length; i++) {
+                  candMap.set(rows[i].buildingId, candData.rows[i]);
+                }
+                buildingStopCandidatesMap = candMap;
+              }
+            }
             return networkScoreMap;
           } catch (error) {
             console.warn('道路網データの取得に失敗しました', error);
@@ -3877,6 +4190,21 @@ export default function PlateauViewer() {
         // 【実験的】道路網距離モデルが選択されていて事前計算データが読み込み済みなら、該当する
         // 建物はそちらの数値をそのまま使う（地形サンプリング不要）。事前計算データに無い建物
         // （オフライン抽出との差分等）は未評価のまま残し、距離モデルを混在させない。
+        const freqOptions: FrequencyEvalOptions = {
+          mode: frequencyModeRef.current,
+          timeBand: frequencyTimeBandRef.current,
+          minPerHour: frequencyMinPerHourRef.current,
+          includeUnlistedOperators: includeUnlistedBusOperatorsRef.current,
+          walkSpeedMPerMin: profile.walkSpeedMPerMin,
+        };
+        const freqBandInfo = FREQUENCY_TIME_BAND_LABELS[freqOptions.timeBand];
+        const frequencyConditionLabel =
+          freqOptions.mode === "none"
+            ? FREQUENCY_EVAL_MODE_LABELS.none
+            : freqOptions.mode === "threshold"
+            ? `${freqBandInfo.shortLabel}（${freqBandInfo.rangeLabel}）・毎時${freqOptions.minPerHour}本以上`
+            : `${freqBandInfo.shortLabel}（${freqBandInfo.rangeLabel}）・${FREQUENCY_EVAL_MODE_LABELS.waitPenalty}`;
+
         let liveCandidates = candidates;
         if (distanceModelRef.current === "network" && networkScoreMap) {
           liveCandidates = [];
@@ -3885,8 +4213,55 @@ export default function PlateauViewer() {
             if (!row) {
               continue;
             }
-            const busEff =
+            let busEff =
               walkProfileRef.current === "general" ? row.busEffectiveDistanceM_general : row.busEffectiveDistanceM_elderly;
+            let busBaseDist =
+              walkProfileRef.current === "general" ? row.busNetworkDistanceM : row.busNetworkDistanceM_elderly;
+            let nearestStopName = row[`nearestStopName_${walkProfileRef.current}`];
+            let nearestStopLat: number | undefined;
+            let nearestStopLng: number | undefined;
+            let nearestStopOperator: string | undefined;
+            let nearestStopPerHour: number | null | undefined;
+            let nearestStopWaitPenaltyMeters = 0;
+            let nearestStopIsPositionOnlyFallback = false;
+
+            const triples = buildingStopCandidatesMap?.get(c.buildingId);
+            if (triples && freqStopsByIndex.length > 0) {
+              if (freqOptions.mode !== "none") {
+                const bestCand = pickBestCandidateStopWithFrequency(
+                  triples,
+                  walkProfileRef.current,
+                  freqStopsByIndex,
+                  freqOptions
+                );
+                if (bestCand) {
+                  busEff = bestCand.effectiveDistanceM;
+                  busBaseDist = bestCand.baseEffectiveDistanceM;
+                  nearestStopName = bestCand.stopName;
+                  nearestStopLat = bestCand.lat;
+                  nearestStopLng = bestCand.lng;
+                  nearestStopOperator = bestCand.operator;
+                  nearestStopPerHour = bestCand.perHour;
+                  nearestStopWaitPenaltyMeters = bestCand.waitPenaltyM;
+                  nearestStopIsPositionOnlyFallback = bestCand.isPositionOnlyFallback;
+                } else {
+                  busEff = Infinity;
+                  busBaseDist = Infinity;
+                  nearestStopName = "条件を満たすバス停なし";
+                  nearestStopPerHour = 0;
+                }
+              } else if (triples.length >= 3) {
+                // 位置基準モードでも最寄り候補バス停の頻度情報をポップアップ用に取得しておく
+                const baseStop = freqStopsByIndex[triples[0]];
+                if (baseStop) {
+                  nearestStopLat = baseStop.lat;
+                  nearestStopLng = baseStop.lng;
+                  nearestStopOperator = baseStop.operator;
+                  nearestStopPerHour = getStopFrequencyPerHour(baseStop, freqOptions.timeBand);
+                }
+              }
+            }
+
             const stationEff =
               walkProfileRef.current === "general"
                 ? row.stationEffectiveDistanceM_general
@@ -3903,10 +4278,17 @@ export default function PlateauViewer() {
               usage: c.usage,
               lat: c.lat,
               lng: c.lng,
-              nearestStopName: row[`nearestStopName_${walkProfileRef.current}`],
+              nearestStopName,
+              nearestStopLat,
+              nearestStopLng,
+              nearestStopOperator,
+              nearestStopPerHour,
+              nearestStopWaitPenaltyMeters,
+              nearestStopIsPositionOnlyFallback,
+              frequencyConditionLabel,
               // 道路網距離モデルには「直線距離」の概念が無いため、勾配加味前の道路網距離を代用する
               // （現状のUIはこの値を表示していないため実用上の影響はない）。
-              busStraightDistanceMeters: walkProfileRef.current === "general" ? row.busNetworkDistanceM : row.busNetworkDistanceM_elderly,
+              busStraightDistanceMeters: busBaseDist,
               busEffectiveDistanceMeters: busEff,
               busWalkMinutes: busEff / profile.walkSpeedMPerMin,
               nearestStationName: row[`nearestStationName_${walkProfileRef.current}`],
@@ -3931,15 +4313,24 @@ export default function PlateauViewer() {
 
         // 各建物の最寄りバス停・最寄り駅を探す。バス停は主要事業者のみを対象にする
         // （理由は上のMAJOR_OPERATOR_KEYWORDSのコメント参照）。駅は5件のみなのでどちらも
-        // 総当たりで十分速い。
+        // 総当たりで十分速い。運行頻度モードが有効な場合は条件を満たすバス停の中から選ぶ。
         const withNearest = liveCandidates.map((c) => {
           let bestStop: BusStop | null = null;
-          let bestStopDist = Infinity;
+          let bestStopScore = Infinity;
           for (const stop of majorOperatorStopList) {
             const d = haversineMeters(c.lat, c.lng, stop.lat, stop.lng);
-            if (d < bestStopDist) {
-              bestStopDist = d;
-              bestStop = stop;
+            if (freqOptions.mode === "none") {
+              if (d < bestStopScore) {
+                bestStopScore = d;
+                bestStop = stop;
+              }
+            } else {
+              const ev = evaluateStopWithFrequency(d, stop.freqItem, freqOptions);
+              if (!ev.eligible) continue;
+              if (ev.effectiveDistanceM < bestStopScore) {
+                bestStopScore = ev.effectiveDistanceM;
+                bestStop = stop;
+              }
             }
           }
           let bestStation: TrainStation | null = null;
@@ -3951,7 +4342,7 @@ export default function PlateauViewer() {
               bestStation = station;
             }
           }
-          return { ...c, nearestStop: bestStop as BusStop, nearestStation: bestStation as TrainStation };
+          return { ...c, nearestStop: bestStop, nearestStation: bestStation as TrainStation };
         });
 
         // バス用ペア・駅用ペアを1つの配列に連結し、地形サンプリングを1回のバッチ呼び出しに
@@ -3961,13 +4352,22 @@ export default function PlateauViewer() {
         // 呼び直すため、ここで最新の値を読めば自動的に新プロファイルで再計算される（profileは
         // このprocessTile関数の先頭で既に取得済み）。
         let results: EffectiveDistanceResult[];
+        const busPairResultIdx: number[] = [];
         try {
-          const busPairs = withNearest.map((c) => ({
-            originLat: c.lat,
-            originLng: c.lng,
-            destLat: c.nearestStop.lat,
-            destLng: c.nearestStop.lng,
-          }));
+          const busPairs: EffectiveDistancePair[] = [];
+          withNearest.forEach((c) => {
+            if (c.nearestStop) {
+              busPairResultIdx.push(busPairs.length);
+              busPairs.push({
+                originLat: c.lat,
+                originLng: c.lng,
+                destLat: c.nearestStop.lat,
+                destLng: c.nearestStop.lng,
+              });
+            } else {
+              busPairResultIdx.push(-1);
+            }
+          });
           const stationPairs = withNearest.map((c) => ({
             originLat: c.lat,
             originLng: c.lng,
@@ -3988,14 +4388,41 @@ export default function PlateauViewer() {
         }
         if (!isCurrent()) return false;
 
-        const n = withNearest.length;
+        const busPairCount = busPairResultIdx.reduce((max, v) => (v >= max ? v + 1 : max), 0);
         withNearest.forEach((c, idx) => {
-          const { straightDistanceMeters: busStraightDistanceMeters, effectiveDistanceMeters: busEffectiveDistanceMeters } =
-            results[idx];
+          const bIdx = busPairResultIdx[idx];
+          let busStraightDistanceMeters = Infinity;
+          let busEffectiveDistanceMeters = Infinity;
+          let nearestStopName = "条件を満たすバス停なし";
+          let nearestStopLat: number | undefined;
+          let nearestStopLng: number | undefined;
+          let nearestStopOperator: string | undefined;
+          let nearestStopPerHour: number | null | undefined = 0;
+          let nearestStopWaitPenaltyMeters = 0;
+          let nearestStopIsPositionOnlyFallback = false;
+
+          if (c.nearestStop && bIdx >= 0) {
+            const busRes = results[bIdx];
+            busStraightDistanceMeters = busRes.straightDistanceMeters;
+            const evaluated = evaluateStopWithFrequency(
+              busRes.effectiveDistanceMeters,
+              c.nearestStop.freqItem,
+              freqOptions
+            );
+            busEffectiveDistanceMeters = evaluated.effectiveDistanceM;
+            nearestStopName = c.nearestStop.name;
+            nearestStopLat = c.nearestStop.lat;
+            nearestStopLng = c.nearestStop.lng;
+            nearestStopOperator = c.nearestStop.operator;
+            nearestStopPerHour = evaluated.perHour;
+            nearestStopWaitPenaltyMeters = evaluated.waitPenaltyM;
+            nearestStopIsPositionOnlyFallback = evaluated.isPositionOnlyFallback;
+          }
+
           const {
             straightDistanceMeters: stationStraightDistanceMeters,
             effectiveDistanceMeters: stationEffectiveDistanceMeters,
-          } = results[n + idx];
+          } = results[busPairCount + idx];
           const busWalkMinutes = busEffectiveDistanceMeters / profile.walkSpeedMPerMin;
           const stationWalkMinutes = stationEffectiveDistanceMeters / profile.walkSpeedMPerMin;
           const coverageRatio = Math.min(
@@ -4007,7 +4434,14 @@ export default function PlateauViewer() {
             usage: c.usage,
             lat: c.lat,
             lng: c.lng,
-            nearestStopName: c.nearestStop.name,
+            nearestStopName,
+            nearestStopLat,
+            nearestStopLng,
+            nearestStopOperator,
+            nearestStopPerHour,
+            nearestStopWaitPenaltyMeters,
+            nearestStopIsPositionOnlyFallback,
+            frequencyConditionLabel,
             busStraightDistanceMeters,
             busEffectiveDistanceMeters,
             busWalkMinutes,
@@ -4091,6 +4525,14 @@ export default function PlateauViewer() {
         networkThresholdMultiplierRef.current = multiplier;
         invalidateScores();
       };
+      async function applyFrequencySettings() {
+        clearRouteComparisonEntities();
+        updateBusStopPinAppearances();
+        const generation = invalidateScores();
+        await new Promise<void>(resolve => window.setTimeout(resolve, 800));
+        if (!cancelled && generation === tileWork.generation) setCenterLoading(null);
+      }
+      applyFrequencySettingsRef.current = () => { void applyFrequencySettings(); };
       disposeRuntime = () => {
         removeLoad?.(); removeVisible?.(); removeUnload?.();
         clickHandler.destroy();
@@ -4245,9 +4687,29 @@ export default function PlateauViewer() {
         if (entity instanceof Cesium.Entity && entity.properties?.isBusStop?.getValue()) {
           const operator: string = entity.properties.operator?.getValue();
           const routes: BusRoute[] = entity.properties.routes?.getValue() ?? [];
-          const lines = [`事業者: ${operator}`];
+          const freqItem: BusStopFrequencyItem | null = entity.properties.freqItem?.getValue() ?? null;
+          const lines: ReactNode[] = [`事業者: ${operator}`];
           if (routes.length > 0) {
             lines.push(`系統: ${routes.map((r) => r.name).join("、")}`);
+          }
+          if (freqItem?.hasOdptTimetable && freqItem.weekday) {
+            const wd = freqItem.weekday;
+            const currentBand = frequencyTimeBandRef.current;
+            const currentPerHour = getStopFrequencyPerHour(freqItem, currentBand);
+            lines.push(
+              <span key="odpt-total" style={{ color: "#7dd3fc" }}>
+                平日発車便数（ODPT）: 合計 {wd.total}便/日（選択中{" "}
+                {FREQUENCY_TIME_BAND_LABELS[currentBand].shortLabel}:{" "}
+                {currentPerHour != null ? currentPerHour.toFixed(1) : "-"}本/時）
+              </span>
+            );
+            lines.push(
+              `時間帯別平均: 終日 ${wd.allDayPerHour.toFixed(1)} / 朝 ${wd.morningPerHour.toFixed(
+                1
+              )} / 日中 ${wd.daytimePerHour.toFixed(1)} / 夜 ${wd.eveningPerHour.toFixed(1)} 本/時`
+            );
+          } else if (operator.includes("江ノ電バス")) {
+            lines.push("運行頻度: ODPT時刻表未公開（位置基準のみ対応）");
           }
           setPopup({ title: entity.name ?? "バス停", lines });
         } else if (entity instanceof Cesium.Entity && entity.properties?.isDemandTransitCandidate?.getValue()) {
@@ -4415,9 +4877,24 @@ export default function PlateauViewer() {
                     </span>,
                   ]
                 : []),
-              `既存最寄りバス停: ${info.nearestStopName}（実効距離 約${Math.round(info.busEffectiveDistanceMeters)}m・徒歩${Math.round(info.busWalkMinutes)}分）`,
+              Number.isFinite(info.busEffectiveDistanceMeters)
+                ? `既存最寄りバス停: ${info.nearestStopName}（実効距離 約${Math.round(info.busEffectiveDistanceMeters)}m・徒歩${Math.round(info.busWalkMinutes)}分）`
+                : `既存最寄りバス停: ${info.nearestStopName}（鉄道駅基準のみで評価）`,
+              ...(info.nearestStopPerHour != null
+                ? [
+                    <span key="freqInfo" style={{ color: "#7dd3fc" }}>
+                      バス停頻度（選択時間帯）: 約{info.nearestStopPerHour.toFixed(1)}本/時
+                      {info.nearestStopWaitPenaltyMeters && info.nearestStopWaitPenaltyMeters > 0
+                        ? `（待ち時間ペナルティ +${info.nearestStopWaitPenaltyMeters}m 含む）`
+                        : ""}
+                    </span>,
+                  ]
+                : info.nearestStopIsPositionOnlyFallback
+                ? ["バス停頻度: ODPT時刻表未公開事業者のため位置基準で評価"]
+                : []),
               `最寄り鉄道駅: ${info.nearestStationName}（実効距離 約${Math.round(info.stationEffectiveDistanceMeters)}m・徒歩${Math.round(info.stationWalkMinutes)}分）`,
               ...(info.totalFloorArea != null ? [`延床面積: 約${Math.round(info.totalFloorArea)}m²`] : []),
+              ...(info.frequencyConditionLabel ? [`運行頻度条件: ${info.frequencyConditionLabel}`] : []),
               `プロファイル: ${info.walkProfileLabel}`,
             ];
 
@@ -4434,8 +4911,10 @@ export default function PlateauViewer() {
               const assignedCustomStop = imp ? customStops.find((s) => s.id === imp.stopId) : undefined;
               let targetStopCoords: { lat: number; lng: number } | null = assignedCustomStop
                 ? { lat: assignedCustomStop.lat, lng: assignedCustomStop.lng }
+                : info.nearestStopLat != null && info.nearestStopLng != null
+                ? { lat: info.nearestStopLat, lng: info.nearestStopLng }
                 : null;
-              if (!targetStopCoords) {
+              if (!targetStopCoords && Number.isFinite(info.busEffectiveDistanceMeters)) {
                 let bestStopDist = Infinity;
                 for (const s of majorOperatorStopList) {
                   if (s.name !== info.nearestStopName) continue;
@@ -4568,6 +5047,7 @@ export default function PlateauViewer() {
       applyWalkProfileRef.current = null;
       applyDistanceModelRef.current = null;
       applyNetworkThresholdMultiplierRef.current = null;
+      applyFrequencySettingsRef.current = null;
       removeCustomStopRef.current = null;
       undoLastCustomStopRef.current = null;
       clearCustomStopsRef.current = null;
@@ -4609,6 +5089,63 @@ export default function PlateauViewer() {
         loadingNetworkScores={loadingNetworkScores}
         networkThresholdMultiplier={networkThresholdMultiplier}
         showExperimentalDistanceModel={showExperimentalDistanceModel}
+        frequencyMode={frequencyMode}
+        frequencyTimeBand={frequencyTimeBand}
+        frequencyMinPerHour={frequencyMinPerHour}
+        includeUnlistedBusOperators={includeUnlistedBusOperators}
+        odptFrequencyLoaded={odptFrequencyLoaded}
+        onFrequencyModeChange={(mode) => {
+          frequencyModeRef.current = mode;
+          setFrequencyMode(mode);
+          const bandInfo = FREQUENCY_TIME_BAND_LABELS[frequencyTimeBandRef.current];
+          const title =
+            mode === "none"
+              ? "位置基準（運行頻度考慮なし）を反映中…"
+              : mode === "threshold"
+              ? `最低運行本数フィルタ（${bandInfo.shortLabel}・${frequencyMinPerHourRef.current}本/時+）を反映中…`
+              : `待ち時間ペナルティ加算（${bandInfo.shortLabel}）を反映中…`;
+          setCenterLoading({
+            title,
+            subtitle: "バス停の運行頻度・時間帯条件で再評価しています",
+          });
+          applyFrequencySettingsRef.current?.();
+        }}
+        onFrequencyTimeBandChange={(band) => {
+          frequencyTimeBandRef.current = band;
+          setFrequencyTimeBand(band);
+          const bandInfo = FREQUENCY_TIME_BAND_LABELS[band];
+          const mode = frequencyModeRef.current;
+          const title =
+            mode === "threshold"
+              ? `${bandInfo.shortLabel}（${bandInfo.rangeLabel}）・${frequencyMinPerHourRef.current}本/時+ を反映中…`
+              : `${bandInfo.shortLabel}（${bandInfo.rangeLabel}）の運行頻度を反映中…`;
+          setCenterLoading({
+            title,
+            subtitle: "時間帯別の運行頻度で建物を再評価しています",
+          });
+          applyFrequencySettingsRef.current?.();
+        }}
+        onFrequencyMinPerHourChange={(minPerHour) => {
+          frequencyMinPerHourRef.current = minPerHour;
+          setFrequencyMinPerHour(minPerHour);
+          const bandInfo = FREQUENCY_TIME_BAND_LABELS[frequencyTimeBandRef.current];
+          setCenterLoading({
+            title: `最低運行本数 ${minPerHour}本/時+（${bandInfo.shortLabel}）を反映中…`,
+            subtitle: "バス停の運行頻度条件で建物を再評価しています",
+          });
+          applyFrequencySettingsRef.current?.();
+        }}
+        onIncludeUnlistedBusOperatorsChange={(include) => {
+          includeUnlistedBusOperatorsRef.current = include;
+          setIncludeUnlistedBusOperators(include);
+          setCenterLoading({
+            title: include
+              ? "江ノ電バスを位置基準で含めて反映中…"
+              : "ODPT時刻表公開路線のみに絞って反映中…",
+            subtitle: "バス停の対象範囲を更新して再評価しています",
+          });
+          applyFrequencySettingsRef.current?.();
+        }}
         onClusterCountChange={(value) => {
           demandTransitClusterCountRef.current = value;
           setDemandTransitClusterCount(value);
@@ -4765,7 +5302,11 @@ export default function PlateauViewer() {
           <span>{roadSnapNotice.message}</span>
         </div>
       )}
-      <UncoloredBuildingsNote />
+      <DataAttributionButton onClick={() => setShowDataAttributionModal(true)} />
+      <DataAttributionModal
+        isOpen={showDataAttributionModal}
+        onClose={() => setShowDataAttributionModal(false)}
+      />
       <DemandTransitRecommendationPanel
         analysis={demandTransitPlanAnalysis}
         selectedCount={demandTransitClusterCount}

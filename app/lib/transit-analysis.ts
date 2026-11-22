@@ -908,5 +908,258 @@ export function buildMobilityHubSimulationGeoJson(params: {
   };
 }
 
+export const BUS_STOP_FREQUENCIES_JSON_URL = "/data/bus-stop-frequencies.json";
+export const BUILDING_STOP_CANDIDATES_JSON_URL = "/data/building-stop-candidates.json";
+
+export type FrequencyTimeBand = "allDay" | "morning" | "daytime" | "evening";
+export type FrequencyEvalMode = "none" | "threshold" | "waitPenalty";
+
+export const FREQUENCY_TIME_BAND_LABELS: Record<
+  FrequencyTimeBand,
+  { label: string; shortLabel: string; rangeLabel: string }
+> = {
+  allDay: { label: "終日（5:00〜22:59）", shortLabel: "終日", rangeLabel: "5〜22時" },
+  morning: { label: "朝ピーク（7:00〜9:59）", shortLabel: "朝", rangeLabel: "7〜9時" },
+  daytime: { label: "日中（10:00〜16:59）", shortLabel: "日中", rangeLabel: "10〜16時" },
+  evening: { label: "夜間（19:00〜22:59）", shortLabel: "夜", rangeLabel: "19〜22時" },
+};
+
+export const FREQUENCY_EVAL_MODE_LABELS: Record<FrequencyEvalMode, string> = {
+  none: "考慮しない（位置基準）",
+  threshold: "最低運行本数フィルタ",
+  waitPenalty: "待ち時間ペナルティ加算",
+};
+
+export type BusStopFrequencyWeekday = {
+  total: number;
+  allDayPerHour: number;
+  morningPerHour: number;
+  daytimePerHour: number;
+  eveningPerHour: number;
+  hourly: number[];
+};
+
+export type BusStopFrequencyItem = {
+  index: number;
+  name: string;
+  operator: string;
+  lat: number;
+  lng: number;
+  hasOdptTimetable: boolean;
+  weekday: BusStopFrequencyWeekday | null;
+};
+
+export type BusStopFrequenciesDataset = {
+  metadata: {
+    source: string;
+    calendar: string;
+    timeBands: Record<FrequencyTimeBand, string>;
+    totalMajorStops: number;
+    matchedKanachuStops: number;
+    totalKanachuStops: number;
+    enodenPositionOnlyStops: number;
+  };
+  stops: BusStopFrequencyItem[];
+};
+
+export type BuildingStopCandidatesDataset = {
+  version: string;
+  k: number;
+  format: string;
+  rows: number[][];
+};
+
+export type FrequencyEvalOptions = {
+  mode: FrequencyEvalMode;
+  timeBand: FrequencyTimeBand;
+  minPerHour: number;
+  includeUnlistedOperators: boolean;
+  walkSpeedMPerMin: number;
+};
+
+export type StopFrequencyEvalResult = {
+  eligible: boolean;
+  effectiveDistanceM: number;
+  waitPenaltyM: number;
+  perHour: number | null;
+  isPositionOnlyFallback: boolean;
+};
+
+export type BestCandidateStopResult = {
+  stopIndex: number;
+  stopName: string;
+  operator: string;
+  lat: number;
+  lng: number;
+  baseEffectiveDistanceM: number;
+  effectiveDistanceM: number;
+  waitPenaltyM: number;
+  perHour: number | null;
+  isPositionOnlyFallback: boolean;
+};
+
+export function getStopFrequencyPerHour(
+  item: BusStopFrequencyItem | null | undefined,
+  timeBand: FrequencyTimeBand
+): number | null {
+  if (!item || !item.hasOdptTimetable || !item.weekday) {
+    return null;
+  }
+  switch (timeBand) {
+    case "morning":
+      return item.weekday.morningPerHour;
+    case "daytime":
+      return item.weekday.daytimePerHour;
+    case "evening":
+      return item.weekday.eveningPerHour;
+    case "allDay":
+    default:
+      return item.weekday.allDayPerHour;
+  }
+}
+
+/**
+ * 運行本数に応じた待ち時間ペナルティ（実効歩行距離換算 m）を算出する。
+ * 毎時4本以上（平均15分間隔以内）を基準0mとし、それ未満は平均待ち時間差の
+ * 25%分を歩行速度換算で加算する（上限400m）。
+ */
+export function computeWaitPenaltyMeters(perHour: number, walkSpeedMPerMin: number): number {
+  if (!Number.isFinite(perHour) || perHour <= 0) {
+    return 400;
+  }
+  if (perHour >= 4) {
+    return 0;
+  }
+  const effectivePerHour = Math.max(perHour, 0.25);
+  const headwayMin = 60 / effectivePerHour;
+  const baselineHeadwayMin = 15;
+  const avgWaitDiffMin = (headwayMin - baselineHeadwayMin) / 2;
+  return Math.min(400, Math.max(0, Math.round(avgWaitDiffMin * 0.25 * walkSpeedMPerMin)));
+}
+
+export function evaluateStopWithFrequency(
+  baseEffectiveDistanceM: number,
+  freqItem: BusStopFrequencyItem | null | undefined,
+  options: FrequencyEvalOptions
+): StopFrequencyEvalResult {
+  if (!Number.isFinite(baseEffectiveDistanceM)) {
+    return {
+      eligible: false,
+      effectiveDistanceM: Infinity,
+      waitPenaltyM: 0,
+      perHour: null,
+      isPositionOnlyFallback: false,
+    };
+  }
+
+  const perHour = getStopFrequencyPerHour(freqItem, options.timeBand);
+
+  if (options.mode === "none") {
+    return {
+      eligible: true,
+      effectiveDistanceM: baseEffectiveDistanceM,
+      waitPenaltyM: 0,
+      perHour,
+      isPositionOnlyFallback: false,
+    };
+  }
+
+  if (!freqItem || !freqItem.hasOdptTimetable || perHour === null) {
+    if (!options.includeUnlistedOperators) {
+      return {
+        eligible: false,
+        effectiveDistanceM: Infinity,
+        waitPenaltyM: 0,
+        perHour: null,
+        isPositionOnlyFallback: false,
+      };
+    }
+    return {
+      eligible: true,
+      effectiveDistanceM: baseEffectiveDistanceM,
+      waitPenaltyM: 0,
+      perHour: null,
+      isPositionOnlyFallback: true,
+    };
+  }
+
+  if (perHour <= 0) {
+    return {
+      eligible: false,
+      effectiveDistanceM: Infinity,
+      waitPenaltyM: options.mode === "waitPenalty" ? 400 : 0,
+      perHour: 0,
+      isPositionOnlyFallback: false,
+    };
+  }
+
+  if (options.mode === "threshold") {
+    if (perHour < options.minPerHour) {
+      return {
+        eligible: false,
+        effectiveDistanceM: Infinity,
+        waitPenaltyM: 0,
+        perHour,
+        isPositionOnlyFallback: false,
+      };
+    }
+    return {
+      eligible: true,
+      effectiveDistanceM: baseEffectiveDistanceM,
+      waitPenaltyM: 0,
+      perHour,
+      isPositionOnlyFallback: false,
+    };
+  }
+
+  const waitPenaltyM = computeWaitPenaltyMeters(perHour, options.walkSpeedMPerMin);
+  return {
+    eligible: true,
+    effectiveDistanceM: baseEffectiveDistanceM + waitPenaltyM,
+    waitPenaltyM,
+    perHour,
+    isPositionOnlyFallback: false,
+  };
+}
+
+export function pickBestCandidateStopWithFrequency(
+  rowTriples: number[],
+  walkProfile: WalkProfile,
+  stopsByIndex: BusStopFrequencyItem[],
+  options: FrequencyEvalOptions
+): BestCandidateStopResult | null {
+  let best: BestCandidateStopResult | null = null;
+
+  for (let i = 0; i + 2 < rowTriples.length; i += 3) {
+    const stopIdx = rowTriples[i];
+    const baseEff = walkProfile === "general" ? rowTriples[i + 1] : rowTriples[i + 2];
+    const freqItem = stopsByIndex[stopIdx];
+    if (!freqItem) {
+      continue;
+    }
+    const evaluated = evaluateStopWithFrequency(baseEff, freqItem, options);
+    if (!evaluated.eligible) {
+      continue;
+    }
+    if (!best || evaluated.effectiveDistanceM < best.effectiveDistanceM) {
+      best = {
+        stopIndex: stopIdx,
+        stopName: freqItem.name,
+        operator: freqItem.operator,
+        lat: freqItem.lat,
+        lng: freqItem.lng,
+        baseEffectiveDistanceM: baseEff,
+        effectiveDistanceM: evaluated.effectiveDistanceM,
+        waitPenaltyM: evaluated.waitPenaltyM,
+        perHour: evaluated.perHour,
+        isPositionOnlyFallback: evaluated.isPositionOnlyFallback,
+      };
+    }
+  }
+
+  return best;
+}
+
+
 
 

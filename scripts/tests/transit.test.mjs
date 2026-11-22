@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 const load = createRequire(`${process.env.TRANSIT_TEST_BUILD}/test.cjs`);
 const { TileWorkGate } = load('./async-generation.js');
 const { NetworkRouter } = load('./network-routing.js');
-const { buildGreedyDemandTransitPlan, evaluateCustomStopsSimulation, buildCustomStopSimulationGeoJson, evaluateMobilityHubSimulation, buildMobilityHubSimulationGeoJson, MOBILITY_HUB_CANDIDATES } = load('./transit-analysis.js');
+const { buildGreedyDemandTransitPlan, evaluateCustomStopsSimulation, buildCustomStopSimulationGeoJson, evaluateMobilityHubSimulation, buildMobilityHubSimulationGeoJson, MOBILITY_HUB_CANDIDATES, getStopFrequencyPerHour, computeWaitPenaltyMeters, evaluateStopWithFrequency, pickBestCandidateStopWithFrequency } = load('./transit-analysis.js');
 
 test('old work cannot overwrite a newer generation; duplicate work is suppressed',async()=>{
   const gate=new TileWorkGate(), tile={}; let release; let value=''; let calls=0;
@@ -213,5 +213,102 @@ test('evaluateMobilityHubSimulation extracts gap buildings within range of hubs'
   assert.equal(perHubSim.outcomes.get('b_toofar')?.mode, 'carshare');
   assert.equal(perHubSim.outcomes.has('b_target'), false); // 500m away, below 1000m
 });
+
+test('ODPT frequency helpers filter stops, compute wait penalties, and handle unlisted operators', () => {
+  const highFreqKanachu = {
+    index: 0,
+    name: '辻堂駅北口',
+    operator: '神奈川中央交通',
+    lat: 35.337,
+    lng: 139.446,
+    hasOdptTimetable: true,
+    weekday: { total: 100, allDayPerHour: 5.56, morningPerHour: 8.0, daytimePerHour: 5.0, eveningPerHour: 4.5, hourly: [] },
+  };
+  const lowFreqKanachu = {
+    index: 1,
+    name: '住宅前',
+    operator: '神奈川中央交通',
+    lat: 35.36,
+    lng: 139.44,
+    hasOdptTimetable: true,
+    weekday: { total: 14, allDayPerHour: 0.78, morningPerHour: 1.33, daytimePerHour: 1.0, eveningPerHour: 0.0, hourly: [] },
+  };
+  const enodenStop = {
+    index: 2,
+    name: '片瀬山',
+    operator: '江ノ電バス',
+    lat: 35.318,
+    lng: 139.486,
+    hasOdptTimetable: false,
+    weekday: null,
+  };
+
+  assert.equal(getStopFrequencyPerHour(highFreqKanachu, 'morning'), 8.0);
+  assert.equal(getStopFrequencyPerHour(lowFreqKanachu, 'evening'), 0.0);
+  assert.equal(getStopFrequencyPerHour(enodenStop, 'daytime'), null);
+
+  assert.equal(computeWaitPenaltyMeters(4, 67), 0);
+  assert.equal(computeWaitPenaltyMeters(6, 50), 0);
+  // 1 bus/hr => headway 60m => (60-15)/2 * 0.25 * 67 = 376.875 => 377m
+  assert.equal(computeWaitPenaltyMeters(1, 67), 377);
+  // 0.25 bus/hr => headway 240m => capped at 400m
+  assert.equal(computeWaitPenaltyMeters(0.25, 67), 400);
+
+  // Threshold mode filters out low-frequency daytime stop (1.0 < 2) and unlisted when flag is false
+  const filteredLow = evaluateStopWithFrequency(120, lowFreqKanachu, {
+    mode: 'threshold',
+    timeBand: 'daytime',
+    minPerHour: 2,
+    includeUnlistedOperators: true,
+    walkSpeedMPerMin: 67,
+  });
+  assert.equal(filteredLow.eligible, false);
+
+  const enodenIncluded = evaluateStopWithFrequency(200, enodenStop, {
+    mode: 'threshold',
+    timeBand: 'daytime',
+    minPerHour: 2,
+    includeUnlistedOperators: true,
+    walkSpeedMPerMin: 67,
+  });
+  assert.equal(enodenIncluded.eligible, true);
+  assert.equal(enodenIncluded.isPositionOnlyFallback, true);
+  assert.equal(enodenIncluded.effectiveDistanceM, 200);
+
+  const enodenExcluded = evaluateStopWithFrequency(200, enodenStop, {
+    mode: 'threshold',
+    timeBand: 'daytime',
+    minPerHour: 2,
+    includeUnlistedOperators: false,
+    walkSpeedMPerMin: 67,
+  });
+  assert.equal(enodenExcluded.eligible, false);
+
+  // Candidate selection: closer low-freq stop (150m, 1/h -> +377m = 527m) loses to farther high-freq stop (320m, 5/h -> +0m = 320m)
+  const triples = [1, 150, 180, 0, 320, 380];
+  const stopsByIndex = [highFreqKanachu, lowFreqKanachu, enodenStop];
+  const bestWait = pickBestCandidateStopWithFrequency(triples, 'general', stopsByIndex, {
+    mode: 'waitPenalty',
+    timeBand: 'daytime',
+    minPerHour: 1,
+    includeUnlistedOperators: true,
+    walkSpeedMPerMin: 67,
+  });
+  assert.ok(bestWait);
+  assert.equal(bestWait.stopIndex, 0);
+  assert.equal(bestWait.effectiveDistanceM, 320);
+  assert.equal(bestWait.waitPenaltyM, 0);
+
+  // Evening: lowFreqKanachu has 0/h, so even in waitPenalty mode it is ineligible
+  const bestEvening = pickBestCandidateStopWithFrequency([1, 150, 180], 'general', stopsByIndex, {
+    mode: 'waitPenalty',
+    timeBand: 'evening',
+    minPerHour: 1,
+    includeUnlistedOperators: true,
+    walkSpeedMPerMin: 67,
+  });
+  assert.equal(bestEvening, null);
+});
+
 
 

@@ -38,7 +38,7 @@ export function SlopeCalculationModal({ isOpen, onClose }: SlopeCalculationModal
         onClick={(e) => e.stopPropagation()}
         style={{
           background: "rgba(15, 23, 42, 0.96)",
-          color: "#e2e8f0",
+          color: "#ffffff",
           border: "1px solid rgba(56, 189, 248, 0.3)",
           borderRadius: 10,
           boxShadow: "0 24px 48px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.05)",
@@ -68,10 +68,10 @@ export function SlopeCalculationModal({ isOpen, onClose }: SlopeCalculationModal
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ fontSize: 18 }}>ℹ️</span>
             <div>
-              <div style={{ fontSize: 15, fontWeight: "bold", color: "#f8fafc" }}>
+              <div style={{ fontSize: 15, fontWeight: "bold", color: "#ffffff" }}>
                 勾配・歩行速度プロファイルの計算のしくみ
               </div>
-              <div style={{ fontSize: 11, color: "#94a3b8" }}>
+              <div style={{ fontSize: 11, color: "#e2e8f0" }}>
                 実効歩行距離の算出ロジックと各係数の役割（藤沢市北部モデル）
               </div>
             </div>
@@ -114,34 +114,34 @@ export function SlopeCalculationModal({ isOpen, onClose }: SlopeCalculationModal
             </div>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, background: "rgba(15, 23, 42, 0.4)", borderRadius: 6, overflow: "hidden" }}>
               <thead>
-                <tr style={{ background: "rgba(30, 41, 59, 0.8)", borderBottom: "1px solid rgba(255, 255, 255, 0.1)" }}>
-                  <th style={{ padding: "8px 10px", textAlign: "left", width: "30%", color: "#cbd5e1" }}>係数</th>
-                  <th style={{ padding: "8px 10px", textAlign: "left", width: "25%", color: "#cbd5e1" }}>役割</th>
-                  <th style={{ padding: "8px 10px", textAlign: "left", color: "#cbd5e1" }}>何を表しているか</th>
+                <tr style={{ background: "rgba(30, 41, 59, 0.8)", borderBottom: "1px solid rgba(255, 255, 255, 0.14)" }}>
+                  <th style={{ padding: "8px 10px", textAlign: "left", width: "30%", color: "#ffffff" }}>係数</th>
+                  <th style={{ padding: "8px 10px", textAlign: "left", width: "25%", color: "#ffffff" }}>役割</th>
+                  <th style={{ padding: "8px 10px", textAlign: "left", color: "#ffffff" }}>何を表しているか</th>
                 </tr>
               </thead>
               <tbody>
-                <tr style={{ borderBottom: "1px solid rgba(255, 255, 255, 0.06)" }}>
-                  <td style={{ padding: "8px 10px", fontWeight: "bold", color: "#f1f5f9" }}>① 勾配ペナルティ係数</td>
+                <tr style={{ borderBottom: "1px solid rgba(255, 255, 255, 0.08)" }}>
+                  <td style={{ padding: "8px 10px", fontWeight: "bold", color: "#ffffff" }}>① 勾配ペナルティ係数</td>
                   <td style={{ padding: "8px 10px", color: "#7dd3fc" }}>「人の体力差」</td>
-                  <td style={{ padding: "8px 10px", color: "#cbd5e1" }}>
+                  <td style={{ padding: "8px 10px", color: "#ffffff" }}>
                     坂の斜度（キツさ）にどれだけ敏感か<br />
-                    <span style={{ fontSize: 11, color: "#94a3b8" }}>
+                    <span style={{ fontSize: 11, color: "#e2e8f0" }}>
                       （運動生理学の知見※に基づき、登坂時のエネルギー消費・筋力負荷が一般成人の約2倍となる身体特性を反映）
                     </span>
                   </td>
                 </tr>
                 <tr>
-                  <td style={{ padding: "8px 10px", fontWeight: "bold", color: "#f1f5f9" }}>② 上り坂の割増倍率</td>
+                  <td style={{ padding: "8px 10px", fontWeight: "bold", color: "#ffffff" }}>② 上り坂の割増倍率</td>
                   <td style={{ padding: "8px 10px", color: "#7dd3fc" }}>「上り・下りと地域の過酷さ」</td>
-                  <td style={{ padding: "8px 10px", color: "#cbd5e1" }}>
+                  <td style={{ padding: "8px 10px", color: "#ffffff" }}>
                     下り坂と比べ、上り坂をどれだけ重くみるか<br />
-                    <span style={{ fontSize: 11, color: "#94a3b8" }}>（重力に逆らう上り坂や団地特有の坂道に対する割増）</span>
+                    <span style={{ fontSize: 11, color: "#e2e8f0" }}>（重力に逆らう上り坂や団地特有の坂道に対する割増）</span>
                   </td>
                 </tr>
               </tbody>
             </table>
-            <div style={{ fontSize: 10.5, color: "#64748b", marginTop: 4, lineHeight: 1.4 }}>
+            <div style={{ fontSize: 10.5, color: "#e2e8f0", marginTop: 4, lineHeight: 1.4 }}>
               ※運動生理学・リハビリテーション分野等の研究において、高齢者の坂道登坂時のエネルギー消費（METs）や身体負荷は若年成人の約1.8〜2.2倍に跳ね上がることが示されている知見を参考に設定。
             </div>
           </div>
@@ -154,19 +154,19 @@ export function SlopeCalculationModal({ isOpen, onClose }: SlopeCalculationModal
             <div
               style={{
                 background: "rgba(0, 0, 0, 0.35)",
-                border: "1px solid rgba(255, 255, 255, 0.12)",
+                border: "1px solid rgba(255, 255, 255, 0.14)",
                 borderRadius: 6,
                 padding: "12px 14px",
                 fontFamily: "monospace",
                 fontSize: 12.5,
-                color: "#e2e8f0",
+                color: "#ffffff",
                 lineHeight: 1.8,
               }}
             >
               <div>
-                実効歩行距離 = 水平距離 × <span style={{ color: "#f8fafc", fontWeight: "bold" }}>[ 1 + (① 勾配ペナルティ係数) × (② 方向割増倍率) × 斜度(勾配) ]</span>
+                実効歩行距離 = 水平距離 × <span style={{ color: "#ffffff", fontWeight: "bold" }}>[ 1 + (① 勾配ペナルティ係数) × (② 方向割増倍率) × 斜度(勾配) ]</span>
               </div>
-              <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4, fontFamily: "sans-serif" }}>
+              <div style={{ fontSize: 11, color: "#e2e8f0", marginTop: 4, fontFamily: "sans-serif" }}>
                 ※上り坂では ②上り坂倍率（1.25倍）、下り坂では下り倍率（1.0倍）を適用。<br />
                 ※極端な崖による過大推計を防ぐため、斜度は最大40%（0.40）で上限キャップを設けています。
               </div>
@@ -180,50 +180,50 @@ export function SlopeCalculationModal({ isOpen, onClose }: SlopeCalculationModal
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               {/* 一般成人 */}
-              <div style={{ background: "rgba(30, 41, 59, 0.6)", border: "1px solid rgba(255, 255, 255, 0.08)", borderRadius: 6, padding: "10px 12px" }}>
+              <div style={{ background: "rgba(30, 41, 59, 0.6)", border: "1px solid rgba(255, 255, 255, 0.12)", borderRadius: 6, padding: "10px 12px" }}>
                 <div style={{ fontWeight: "bold", color: "#93c5fd", marginBottom: 4 }}>
                   一般（標準の坂道補正）
                 </div>
-                <div style={{ fontSize: 11.5, color: "#cbd5e1" }}>
+                <div style={{ fontSize: 11.5, color: "#ffffff" }}>
                   ・勾配ペナルティ: <strong>3.0</strong><br />
                   ・上り坂割増: <strong>1.25倍</strong><br />
                   ・基準歩行速度: <strong>67m/分</strong>（分速80mの約84%）
                 </div>
-                <div style={{ marginTop: 8, paddingTop: 6, borderTop: "1px solid rgba(255, 255, 255, 0.08)", fontSize: 12 }}>
-                  <div style={{ color: "#94a3b8", fontSize: 11 }}>100m登ったときの実効距離:</div>
-                  <div style={{ fontFamily: "monospace", fontSize: 11, color: "#cbd5e1", marginTop: 2 }}>
+                <div style={{ marginTop: 8, paddingTop: 6, borderTop: "1px solid rgba(255, 255, 255, 0.12)", fontSize: 12 }}>
+                  <div style={{ color: "#e2e8f0", fontSize: 11 }}>100m登ったときの実効距離:</div>
+                  <div style={{ fontFamily: "monospace", fontSize: 11, color: "#ffffff", marginTop: 2 }}>
                     100m × (1 + 3.0 × 1.25 × 0.10)
                   </div>
                   <div style={{ fontWeight: "bold", color: "#38bdf8", fontSize: 14 }}>
                     = 約138m
                   </div>
-                  <div style={{ fontSize: 11, color: "#94a3b8" }}>平地と比べて約1.38倍の距離負担</div>
+                  <div style={{ fontSize: 11, color: "#e2e8f0" }}>平地と比べて約1.38倍の距離負担</div>
                 </div>
               </div>
 
               {/* 高齢者 */}
-              <div style={{ background: "rgba(30, 41, 59, 0.6)", border: "1px solid rgba(245, 158, 11, 0.2)", borderRadius: 6, padding: "10px 12px" }}>
+              <div style={{ background: "rgba(30, 41, 59, 0.6)", border: "1px solid rgba(245, 158, 11, 0.25)", borderRadius: 6, padding: "10px 12px" }}>
                 <div style={{ fontWeight: "bold", color: "#fcd34d", marginBottom: 4 }}>
                   高齢者（坂道の負荷係数2倍）
                 </div>
-                <div style={{ fontSize: 11.5, color: "#cbd5e1" }}>
+                <div style={{ fontSize: 11.5, color: "#ffffff" }}>
                   ・勾配ペナルティ: <strong>6.0</strong>（一般の2倍）<br />
                   ・上り坂割増: <strong>1.25倍</strong><br />
                   ・基準歩行速度: <strong>50m/分</strong>
                 </div>
-                <div style={{ marginTop: 8, paddingTop: 6, borderTop: "1px solid rgba(255, 255, 255, 0.08)", fontSize: 12 }}>
-                  <div style={{ color: "#94a3b8", fontSize: 11 }}>100m登ったときの実効距離:</div>
-                  <div style={{ fontFamily: "monospace", fontSize: 11, color: "#cbd5e1", marginTop: 2 }}>
+                <div style={{ marginTop: 8, paddingTop: 6, borderTop: "1px solid rgba(255, 255, 255, 0.12)", fontSize: 12 }}>
+                  <div style={{ color: "#e2e8f0", fontSize: 11 }}>100m登ったときの実効距離:</div>
+                  <div style={{ fontFamily: "monospace", fontSize: 11, color: "#ffffff", marginTop: 2 }}>
                     100m × (1 + 6.0 × 1.25 × 0.10)
                   </div>
                   <div style={{ fontWeight: "bold", color: "#fbbf24", fontSize: 14 }}>
                     = 約175m
                   </div>
-                  <div style={{ fontSize: 11, color: "#94a3b8" }}>平地と比べて約1.75倍の距離負担</div>
+                  <div style={{ fontSize: 11, color: "#e2e8f0" }}>平地と比べて約1.75倍の距離負担</div>
                 </div>
               </div>
             </div>
-            <div style={{ marginTop: 8, fontSize: 11, color: "#94a3b8", lineHeight: 1.5 }}>
+            <div style={{ marginTop: 8, fontSize: 11, color: "#e2e8f0", lineHeight: 1.5 }}>
               ※湘南大庭や遠藤地区など、丘陵地に造成された住宅団地における坂道移動の実態（徒歩困難度）に即した判定を行っています。
             </div>
           </div>
