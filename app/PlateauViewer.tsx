@@ -94,7 +94,8 @@ const BUS_STOP_PIXEL_SIZE = 10;
 // 「同じ系統だがその他事業者」と分かるようにしている。
 const BUS_STOP_COLOR_MINOR = Cesium.Color.fromCssColorString("#fde68a");
 const BUS_STOP_PIXEL_SIZE_MINOR = BUS_STOP_PIXEL_SIZE;
-const BUS_STOP_COLOR_FREQ_EXCLUDED = Cesium.Color.fromCssColorString("#64748b");
+const BUS_STOP_COLOR_FREQ_EXCLUDED = Cesium.Color.fromCssColorString("#94a3b8");
+const BUS_STOP_PIXEL_SIZE_EXCLUDED = 8;
 
 // 起動時の初期カメラ表示範囲（ユーザー指定の中心点・半径・角度）。
 const INITIAL_VIEW_CENTER_LNG = 139.44893;
@@ -233,6 +234,7 @@ type BuildingScoreInfo = {
   nearestStopPerHour?: number | null;
   nearestStopWaitPenaltyMeters?: number;
   nearestStopIsPositionOnlyFallback?: boolean;
+  positionFallbackStopLabel?: string;
   frequencyConditionLabel?: string;
   busStraightDistanceMeters: number;
   busEffectiveDistanceMeters: number;
@@ -2976,6 +2978,17 @@ export default function PlateauViewer() {
       let majorOperatorStopList: BusStop[] = [];
       type BusStopPinRecord = { entity: Cesium.Entity; isMajor: boolean; freqItem: BusStopFrequencyItem | null };
       const busStopPinRecords: BusStopPinRecord[] = [];
+      function applyBusStopPointStyle(
+        point: Cesium.PointGraphics,
+        color: Cesium.Color,
+        pixelSize: number,
+        outlineWidth: number
+      ) {
+        point.color = new Cesium.ConstantProperty(color);
+        point.pixelSize = new Cesium.ConstantProperty(pixelSize);
+        point.outlineWidth = new Cesium.ConstantProperty(outlineWidth);
+      }
+
       function updateBusStopPinAppearances() {
         const mode = frequencyModeRef.current;
         const timeBand = frequencyTimeBandRef.current;
@@ -2984,47 +2997,41 @@ export default function PlateauViewer() {
         for (const rec of busStopPinRecords) {
           if (!rec.entity.point) continue;
           if (!rec.isMajor) {
-            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_MINOR);
-            rec.entity.point.pixelSize = new Cesium.ConstantProperty(BUS_STOP_PIXEL_SIZE_MINOR);
-            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+            applyBusStopPointStyle(rec.entity.point, BUS_STOP_COLOR_MINOR, BUS_STOP_PIXEL_SIZE_MINOR, 1);
             continue;
           }
           if (mode === "none") {
-            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
-            rec.entity.point.pixelSize = new Cesium.ConstantProperty(BUS_STOP_PIXEL_SIZE);
-            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+            applyBusStopPointStyle(rec.entity.point, BUS_STOP_COLOR, BUS_STOP_PIXEL_SIZE, 1);
             continue;
           }
           const freq = rec.freqItem;
           if (!freq || !freq.hasOdptTimetable) {
             if (includeUnlisted) {
-              rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
-              rec.entity.point.pixelSize = new Cesium.ConstantProperty(9);
-              rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+              applyBusStopPointStyle(rec.entity.point, BUS_STOP_COLOR, 9, 1);
             } else {
-              rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_FREQ_EXCLUDED);
-              rec.entity.point.pixelSize = new Cesium.ConstantProperty(6);
-              rec.entity.point.outlineWidth = new Cesium.ConstantProperty(0);
+              applyBusStopPointStyle(
+                rec.entity.point,
+                BUS_STOP_COLOR_FREQ_EXCLUDED,
+                BUS_STOP_PIXEL_SIZE_EXCLUDED,
+                1
+              );
             }
             continue;
           }
           const perHour = getStopFrequencyPerHour(freq, timeBand) ?? 0;
           if (perHour <= 0 || (mode === "threshold" && perHour < minPerHour)) {
-            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR_FREQ_EXCLUDED);
-            rec.entity.point.pixelSize = new Cesium.ConstantProperty(6);
-            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(0);
+            applyBusStopPointStyle(
+              rec.entity.point,
+              BUS_STOP_COLOR_FREQ_EXCLUDED,
+              BUS_STOP_PIXEL_SIZE_EXCLUDED,
+              1
+            );
           } else if (perHour >= 4) {
-            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
-            rec.entity.point.pixelSize = new Cesium.ConstantProperty(12);
-            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(2);
+            applyBusStopPointStyle(rec.entity.point, BUS_STOP_COLOR, 12, 2);
           } else if (perHour >= 1) {
-            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
-            rec.entity.point.pixelSize = new Cesium.ConstantProperty(9);
-            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+            applyBusStopPointStyle(rec.entity.point, BUS_STOP_COLOR, 9, 1);
           } else {
-            rec.entity.point.color = new Cesium.ConstantProperty(BUS_STOP_COLOR);
-            rec.entity.point.pixelSize = new Cesium.ConstantProperty(7);
-            rec.entity.point.outlineWidth = new Cesium.ConstantProperty(1);
+            applyBusStopPointStyle(rec.entity.point, BUS_STOP_COLOR, 7, 1);
           }
         }
         viewer.scene.requestRender();
@@ -4222,6 +4229,7 @@ export default function PlateauViewer() {
             let nearestStopPerHour: number | null | undefined;
             let nearestStopWaitPenaltyMeters = 0;
             let nearestStopIsPositionOnlyFallback = false;
+            let positionFallbackStopLabel: string | undefined;
 
             const triples = buildingStopCandidatesMap?.get(c.buildingId);
             if (triples && freqStopsByIndex.length > 0) {
@@ -4246,7 +4254,20 @@ export default function PlateauViewer() {
                   busEff = Infinity;
                   busBaseDist = Infinity;
                   nearestStopName = "条件を満たすバス停なし";
-                  nearestStopPerHour = 0;
+                  nearestStopPerHour = undefined;
+                  const baseStop = triples.length >= 3 ? freqStopsByIndex[triples[0]] : undefined;
+                  const baseEff =
+                    triples.length >= 3
+                      ? walkProfileRef.current === "general"
+                        ? triples[1]
+                        : triples[2]
+                      : busEff;
+                  if (baseStop && Number.isFinite(baseEff)) {
+                    const basePerHour = getStopFrequencyPerHour(baseStop, freqOptions.timeBand);
+                    positionFallbackStopLabel = `${baseStop.name}（実効距離 約${Math.round(baseEff)}m・${
+                      basePerHour != null ? `${freqBandInfo.shortLabel} ${basePerHour.toFixed(1)}本/時` : "ODPT時刻表未公開"
+                    }）`;
+                  }
                 }
               } else if (triples.length >= 3) {
                 // 位置基準モードでも最寄り候補バス停の頻度情報をポップアップ用に取得しておく
@@ -4283,6 +4304,7 @@ export default function PlateauViewer() {
               nearestStopPerHour,
               nearestStopWaitPenaltyMeters,
               nearestStopIsPositionOnlyFallback,
+              positionFallbackStopLabel,
               frequencyConditionLabel,
               // 道路網距離モデルには「直線距離」の概念が無いため、勾配加味前の道路網距離を代用する
               // （現状のUIはこの値を表示していないため実用上の影響はない）。
@@ -4315,8 +4337,14 @@ export default function PlateauViewer() {
         const withNearest = liveCandidates.map((c) => {
           let bestStop: BusStop | null = null;
           let bestStopScore = Infinity;
+          let closestPosStop: BusStop | null = null;
+          let closestPosDist = Infinity;
           for (const stop of majorOperatorStopList) {
             const d = haversineMeters(c.lat, c.lng, stop.lat, stop.lng);
+            if (d < closestPosDist) {
+              closestPosDist = d;
+              closestPosStop = stop;
+            }
             if (freqOptions.mode === "none") {
               if (d < bestStopScore) {
                 bestStopScore = d;
@@ -4340,7 +4368,7 @@ export default function PlateauViewer() {
               bestStation = station;
             }
           }
-          return { ...c, nearestStop: bestStop, nearestStation: bestStation as TrainStation };
+          return { ...c, nearestStop: bestStop, closestPosStop, nearestStation: bestStation as TrainStation };
         });
 
         // バス用ペア・駅用ペアを1つの配列に連結し、地形サンプリングを1回のバッチ呼び出しに
@@ -4354,13 +4382,14 @@ export default function PlateauViewer() {
         try {
           const busPairs: EffectiveDistancePair[] = [];
           withNearest.forEach((c) => {
-            if (c.nearestStop) {
+            const targetStop = c.nearestStop ?? c.closestPosStop;
+            if (targetStop) {
               busPairResultIdx.push(busPairs.length);
               busPairs.push({
                 originLat: c.lat,
                 originLng: c.lng,
-                destLat: c.nearestStop.lat,
-                destLng: c.nearestStop.lng,
+                destLat: targetStop.lat,
+                destLng: targetStop.lng,
               });
             } else {
               busPairResultIdx.push(-1);
@@ -4395,9 +4424,10 @@ export default function PlateauViewer() {
           let nearestStopLat: number | undefined;
           let nearestStopLng: number | undefined;
           let nearestStopOperator: string | undefined;
-          let nearestStopPerHour: number | null | undefined = 0;
+          let nearestStopPerHour: number | null | undefined;
           let nearestStopWaitPenaltyMeters = 0;
           let nearestStopIsPositionOnlyFallback = false;
+          let positionFallbackStopLabel: string | undefined;
 
           if (c.nearestStop && bIdx >= 0) {
             const busRes = results[bIdx];
@@ -4415,6 +4445,12 @@ export default function PlateauViewer() {
             nearestStopPerHour = evaluated.perHour;
             nearestStopWaitPenaltyMeters = evaluated.waitPenaltyM;
             nearestStopIsPositionOnlyFallback = evaluated.isPositionOnlyFallback;
+          } else if (c.closestPosStop && bIdx >= 0) {
+            const fallbackRes = results[bIdx];
+            const fbPerHour = getStopFrequencyPerHour(c.closestPosStop.freqItem, freqOptions.timeBand);
+            positionFallbackStopLabel = `${c.closestPosStop.name}（実効距離 約${Math.round(
+              fallbackRes.effectiveDistanceMeters
+            )}m・${fbPerHour != null ? `${freqBandInfo.shortLabel} ${fbPerHour.toFixed(1)}本/時` : "ODPT時刻表未公開"}）`;
           }
 
           const {
@@ -4439,6 +4475,7 @@ export default function PlateauViewer() {
             nearestStopPerHour,
             nearestStopWaitPenaltyMeters,
             nearestStopIsPositionOnlyFallback,
+            positionFallbackStopLabel,
             frequencyConditionLabel,
             busStraightDistanceMeters,
             busEffectiveDistanceMeters,
@@ -4877,7 +4914,10 @@ export default function PlateauViewer() {
                 : []),
               Number.isFinite(info.busEffectiveDistanceMeters)
                 ? `既存最寄りバス停: ${info.nearestStopName}（実効距離 約${Math.round(info.busEffectiveDistanceMeters)}m・徒歩${Math.round(info.busWalkMinutes)}分）`
-                : `既存最寄りバス停: ${info.nearestStopName}（鉄道駅基準のみで評価）`,
+                : `既存最寄りバス停: ${info.nearestStopName}`,
+              ...(info.positionFallbackStopLabel
+                ? [`（位置基準の最寄り）: ${info.positionFallbackStopLabel}`]
+                : []),
               ...(info.nearestStopPerHour != null
                 ? [
                     <span key="freqInfo" style={{ color: "#7dd3fc" }}>

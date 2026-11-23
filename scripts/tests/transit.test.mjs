@@ -308,6 +308,19 @@ test('ODPT frequency helpers filter stops, compute wait penalties, and handle un
     walkSpeedMPerMin: 67,
   });
   assert.equal(bestEvening, null);
+
+  // Variable-length row (>6 candidates within 600m): 7th candidate qualifies when 1st-6th fail
+  const sevenCandidates = [1, 120, 140, 1, 180, 200, 1, 220, 240, 1, 260, 280, 1, 300, 320, 1, 340, 360, 0, 450, 480];
+  const bestSeventh = pickBestCandidateStopWithFrequency(sevenCandidates, 'general', stopsByIndex, {
+    mode: 'threshold',
+    timeBand: 'daytime',
+    minPerHour: 2,
+    includeUnlistedOperators: true,
+    walkSpeedMPerMin: 67,
+  });
+  assert.ok(bestSeventh);
+  assert.equal(bestSeventh.stopIndex, 0);
+  assert.equal(bestSeventh.effectiveDistanceM, 450);
 });
 
 
